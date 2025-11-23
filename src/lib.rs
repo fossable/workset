@@ -106,101 +106,6 @@ impl TryFrom<&str> for WorkspaceName {
     }
 }
 
-/// Represents the user's config file
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Config {
-    pub workspace: Vec<Workspace>,
-
-    /// The cache directory for all workspaces
-    #[serde(flatten)]
-    pub cache: Option<RepoCache>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        let home = home::home_dir().expect("the home directory exists");
-
-        Self {
-            workspace: vec![Workspace {
-                name: Some("default".into()),
-                path: home.join("workspace").display().to_string(),
-                remotes: vec![],
-            }],
-            cache: Some(RepoCache {
-                path: home.join(".cache/wsx").display().to_string(),
-            }),
-        }
-    }
-}
-
-impl Config {
-    /// Load the application config from the filesystem or provide a default if
-    /// none exists.
-    pub fn load() -> Result<Self> {
-        let config_path = match home::home_dir() {
-            Some(home) => format!("{}/.config/wsx.toml", home.display()),
-            None => bail!("Home directory not found"),
-        };
-        debug!(config_path = %config_path, "Searching for configuration file");
-
-        let config: Config = match std::fs::metadata(&config_path) {
-            Ok(_) => toml::from_str(&std::fs::read_to_string(config_path)?)?,
-            Err(_) => Config::default(),
-        };
-        debug!(config = ?config, "Loaded configuration");
-
-        // Make sure all necessary directories exist
-        if let Some(cache) = config.cache.as_ref() {
-            std::fs::create_dir_all(&cache.path)?;
-        }
-        for workspace in config.workspace.iter() {
-            std::fs::create_dir_all(&workspace.path)?;
-        }
-
-        Ok(config)
-    }
-
-    /// Find a configured workspace by name.
-    pub fn workspace_by_name(&self, workspace_name: &str) -> Option<&Workspace> {
-        self.workspace.iter().find(|&w| match &w.name {
-            Some(name) => name == workspace_name,
-            None => false,
-        })
-    }
-
-    /// Find a workspace that contains the given directory path.
-    /// Returns the workspace whose path is a parent of the given directory.
-    pub fn workspace_from_path(&self, dir: &Path) -> Option<&Workspace> {
-        use std::path::PathBuf;
-
-        let canonical_dir = match dir.canonicalize() {
-            Ok(p) => p,
-            Err(_) => return None,
-        };
-
-        // Find workspace that contains this directory
-        self.workspace.iter().find(|w| {
-            if let Ok(ws_path) = PathBuf::from(&w.path).canonicalize() {
-                canonical_dir.starts_with(&ws_path)
-            } else {
-                false
-            }
-        })
-    }
-
-    /// Resolve a repository pattern against local repositories.
-    /// Searches all workspaces since workspace is now specified separately via CLI flag.
-    pub fn search_local(&self, pattern: &RepoPattern) -> Result<Vec<PathBuf>> {
-        let mut all_repos = Vec::new();
-
-        for workspace in &self.workspace {
-            let repos = workspace.search(pattern)?;
-            all_repos.extend(repos);
-        }
-
-        Ok(all_repos)
-    }
-}
 
 /// Recursively find "top-level" git repositories.
 fn find_git_dir(path: &str) -> Result<Vec<PathBuf>> {
@@ -224,23 +129,148 @@ fn find_git_dir(path: &str) -> Result<Vec<PathBuf>> {
     Ok(found)
 }
 
+/// Check if a repository has uncommitted changes using git-oxide
+fn has_uncommitted_changes(repo_path: &Path) -> Result<bool> {
+    use tracing::warn;
+
+    let repo = match gix::open(repo_path) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Failed to open repository at {}: {}", repo_path.display(), e);
+            return Ok(false); // If we can't open it, assume it's not dirty
+        }
+    };
+
+    // Get working directory
+    let workdir = repo.work_dir()
+        .ok_or_else(|| anyhow::anyhow!("Repository has no working directory"))?;
+
+    // Check for any changes using a simple approach:
+    // 1. Check if HEAD exists
+    let mut head = repo.head()?;
+    let _head_commit = head.peel_to_commit_in_place()?;
+
+    // 2. Check if index has changes (check entry count or state)
+    let index = repo.index_or_empty()?;
+
+    // For tracked files, check if they've been modified or deleted
+    for entry in index.entries() {
+        let file_path = workdir.join(gix::path::from_bstr(entry.path(&index)));
+
+        // Check if file was deleted
+        if !file_path.exists() {
+            return Ok(true);
+        }
+
+        // Check if file size changed (quick check for modifications)
+        if let Ok(metadata) = std::fs::metadata(&file_path) {
+            // Size mismatch indicates changes
+            if metadata.len() != entry.stat.size as u64 {
+                return Ok(true);
+            }
+
+            // Check modification time as a hint (not definitive but fast)
+            if let Ok(mtime) = metadata.modified() {
+                if let Ok(duration) = mtime.duration_since(std::time::UNIX_EPOCH) {
+                    let file_mtime = duration.as_secs() as u32;
+                    if file_mtime != entry.stat.mtime.secs {
+                        // File might be modified, this is a heuristic
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(false)
+}
+
 /// A `Workspace` is filesystem directory containing git repositories checked out
 /// from one or more remotes. Each repository's path matches the remote's path,
 /// for example:
-///     <workspace path>/github.com/cilki/wsx
+///     <workspace path>/github.com/fossable/workset
+///
+/// This is stored in .workset.toml in the workspace root.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Workspace {
     /// A user-friendly name for the workspace like "personal" or "work"
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
-    /// The workspace directory's filesystem path
+    /// The workspace directory's filesystem path (not serialized, set at runtime)
+    #[serde(skip)]
     pub path: String,
 
     /// A list of providers for the workspace
+    #[serde(default)]
     pub remotes: Vec<Remote>,
+
+    /// The library directory for this workspace
+    #[serde(flatten)]
+    pub library: Option<Library>,
+}
+
+impl Default for Workspace {
+    fn default() -> Self {
+        let home = home::home_dir().expect("the home directory exists");
+
+        Self {
+            name: None,
+            path: std::env::current_dir()
+                .ok()
+                .unwrap_or_else(|| home.join("workspace"))
+                .display()
+                .to_string(),
+            remotes: vec![],
+            library: Some(Library {
+                path: home.join(".local/share/workset/library").display().to_string(),
+            }),
+        }
+    }
 }
 
 impl Workspace {
+    /// Find the workspace root by searching for .workset.toml starting from current directory
+    /// and walking up the directory tree.
+    fn find_workspace_root() -> Result<PathBuf> {
+        let mut current = std::env::current_dir()?;
+
+        loop {
+            let config_path = current.join(".workset.toml");
+            if config_path.exists() {
+                return Ok(current);
+            }
+
+            // Try parent directory
+            match current.parent() {
+                Some(parent) => current = parent.to_path_buf(),
+                None => bail!("Not in a workset workspace. Run 'workset init' to create one."),
+            }
+        }
+    }
+
+    /// Load the workspace config from .workset.toml in the workspace root.
+    pub fn load() -> Result<Self> {
+        let workspace_root = Self::find_workspace_root()?;
+        let config_path = workspace_root.join(".workset.toml");
+
+        debug!(config_path = %config_path.display(), "Loading workspace configuration");
+
+        let mut workspace: Workspace = toml::from_str(&std::fs::read_to_string(&config_path)?)?;
+
+        // Set the workspace path to the actual root directory
+        workspace.path = workspace_root.display().to_string();
+
+        debug!(workspace = ?workspace, "Loaded workspace configuration");
+
+        // Make sure library directory exists
+        if let Some(library) = workspace.library.as_ref() {
+            std::fs::create_dir_all(&library.path)?;
+        }
+
+        Ok(workspace)
+    }
+
     /// Get a user-friendly name for the workspace
     pub fn name(&self) -> String {
         match &self.name {
@@ -270,7 +300,7 @@ impl Workspace {
     }
 
     /// Clone/open a repository in this workspace
-    pub fn open(&self, cache: Option<&RepoCache>, pattern: &RepoPattern) -> Result<PathBuf> {
+    pub fn open(&self, library: Option<&Library>, pattern: &RepoPattern) -> Result<PathBuf> {
         use tracing::{debug, info};
 
         debug!(pattern = ?pattern, "Opening repos");
@@ -285,12 +315,12 @@ impl Workspace {
             return Ok(local_repos[0].clone());
         }
 
-        // Check cache and restore if found
-        if let Some(cache) = cache {
+        // Check library and restore if found
+        if let Some(library) = library {
             let repo_path = format!("{}/{}", self.path, pattern.full_path());
-            if cache.exists(repo_path.clone()) {
-                info!("Restoring from cache: {}", pattern.full_path());
-                cache.uncache(repo_path.clone())?;
+            if library.exists(repo_path.clone()) {
+                info!("Restoring from library: {}", pattern.full_path());
+                library.restore(repo_path.clone())?;
                 return Ok(PathBuf::from(repo_path));
             }
         }
@@ -303,27 +333,64 @@ impl Workspace {
     }
 
     /// Drop a repository from this workspace
-    pub fn drop(&self, cache: Option<&RepoCache>, pattern: &RepoPattern) -> Result<()> {
-        use tracing::debug;
+    pub fn drop(&self, library: Option<&Library>, pattern: &RepoPattern, delete: bool, force: bool) -> Result<()> {
+        use tracing::{debug, info, warn};
 
         debug!("Drop requested for pattern: {:?}", pattern);
 
         let repos = self.search(pattern)?;
 
         for repo in repos {
-            let out = run_fun!(git -C $repo status --porcelain)?;
-            if out.is_empty() {
-                if let Some(cache) = cache {
-                    // Cache the repository
-                    cache.cache(repo.to_string_lossy().to_string())?;
-                }
-
-                // Remove the directory
-                debug!("Removing directory: {:?}", &repo);
-                std::fs::remove_dir_all(repo)?;
-            } else {
-                debug!("Refusing to drop repository with uncommitted changes");
+            // Check for uncommitted changes unless --force is given
+            if !force && has_uncommitted_changes(&repo)? {
+                warn!("Refusing to drop repository with uncommitted changes: {}", repo.display());
+                warn!("Use --force to drop anyway");
+                continue;
             }
+
+            if !delete {
+                if let Some(library) = library {
+                    // Store the repository in the library
+                    info!("Storing {} in library", repo.display());
+                    library.store(repo.to_string_lossy().to_string())?;
+                }
+            }
+
+            // Remove the directory
+            debug!("Removing directory: {:?}", &repo);
+            std::fs::remove_dir_all(repo)?;
+        }
+        Ok(())
+    }
+
+    /// Drop all repositories in the current directory
+    pub fn drop_all(&self, library: Option<&Library>, delete: bool, force: bool) -> Result<()> {
+        use tracing::{debug, info, warn};
+
+        debug!("Drop all requested in current directory");
+
+        let cwd = std::env::current_dir()?;
+        let repos = find_git_dir(&cwd.to_string_lossy())?;
+
+        for repo in repos {
+            // Check for uncommitted changes unless --force is given
+            if !force && has_uncommitted_changes(&repo)? {
+                warn!("Refusing to drop repository with uncommitted changes: {}", repo.display());
+                warn!("Use --force to drop anyway");
+                continue;
+            }
+
+            if !delete {
+                if let Some(library) = library {
+                    // Store the repository in the library
+                    info!("Storing {} in library", repo.display());
+                    library.store(repo.to_string_lossy().to_string())?;
+                }
+            }
+
+            // Remove the directory
+            debug!("Removing directory: {:?}", &repo);
+            std::fs::remove_dir_all(repo)?;
         }
         Ok(())
     }
@@ -356,43 +423,43 @@ impl Workspace {
     }
 }
 
-/// Caches repositories that are dropped from a `Workspace` in a separate directory.
-/// Entries in this cache are bare repositories for space efficiency.
+/// Stores repositories that are dropped from a `Workspace` in a library directory.
+/// Entries in the library are bare repositories for space efficiency.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct RepoCache {
+pub struct Library {
     pub path: String,
 }
 
-impl RepoCache {
-    /// Move the given repository into the cache.
-    pub fn cache(&self, repo_path: String) -> Result<()> {
-        // Make sure the cache directory exists first
+impl Library {
+    /// Move the given repository into the library.
+    pub fn store(&self, repo_path: String) -> Result<()> {
+        // Make sure the library directory exists first
         std::fs::create_dir_all(&self.path)?;
 
         let source = format!("{}/.git", repo_path);
-        let dest = self.compute_cache_key(&repo_path);
+        let dest = self.compute_library_key(&repo_path);
         run_fun!(git -C $source config core.bare true)?;
 
-        debug!(source = %source, dest = %dest, "Caching repository");
+        debug!(source = %source, dest = %dest, "Storing repository in library");
 
-        // Clear the cache entry if it exists
+        // Clear the library entry if it exists
         std::fs::remove_dir_all(&dest).ok();
 
         run_fun!(mv $source $dest)?;
         Ok(())
     }
 
-    pub fn uncache(&self, repo_path: String) -> Result<()> {
-        let source = self.compute_cache_key(&repo_path);
+    pub fn restore(&self, repo_path: String) -> Result<()> {
+        let source = self.compute_library_key(&repo_path);
         run_fun!(git clone $source $repo_path)?;
         Ok(())
     }
 
     pub fn exists(&self, repo_path: String) -> bool {
-        std::fs::metadata(self.compute_cache_key(&repo_path)).is_ok()
+        std::fs::metadata(self.compute_library_key(&repo_path)).is_ok()
     }
 
-    fn compute_cache_key(&self, path: &str) -> String {
+    fn compute_library_key(&self, path: &str) -> String {
         format!(
             "{}/{:x}",
             self.path,
@@ -408,41 +475,10 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_config_default() {
-        let config = Config::default();
-        assert_eq!(config.workspace.len(), 1);
-        assert_eq!(config.workspace[0].name, Some("default".to_string()));
-        assert!(config.cache.is_some());
-    }
-
-    #[test]
-    fn test_workspace_by_name() {
-        let config = Config {
-            workspace: vec![
-                Workspace {
-                    name: Some("work".to_string()),
-                    path: "/work".to_string(),
-                    remotes: vec![],
-                },
-                Workspace {
-                    name: Some("personal".to_string()),
-                    path: "/personal".to_string(),
-                    remotes: vec![],
-                },
-            ],
-            cache: None,
-        };
-
-        let workspace = config.workspace_by_name("work");
-        assert!(workspace.is_some());
-        assert_eq!(workspace.unwrap().path, "/work");
-
-        let workspace = config.workspace_by_name("personal");
-        assert!(workspace.is_some());
-        assert_eq!(workspace.unwrap().path, "/personal");
-
-        let workspace = config.workspace_by_name("nonexistent");
-        assert!(workspace.is_none());
+    fn test_workspace_default() {
+        let workspace = Workspace::default();
+        assert!(workspace.library.is_some());
+        assert!(!workspace.path.is_empty());
     }
 
     #[test]
@@ -463,33 +499,33 @@ mod tests {
     }
 
     #[test]
-    fn test_repo_cache_exists() {
+    fn test_library_exists() {
         let temp_dir = TempDir::new().unwrap();
-        let cache = RepoCache {
+        let library = Library {
             path: temp_dir.path().to_string_lossy().to_string(),
         };
 
         let repo_path = "/test/repo";
-        assert!(!cache.exists(repo_path.to_string()));
+        assert!(!library.exists(repo_path.to_string()));
 
-        // Create the cache directory
-        let cache_key = cache.compute_cache_key(repo_path);
-        fs::create_dir_all(&cache_key).unwrap();
+        // Create the library directory
+        let library_key = library.compute_library_key(repo_path);
+        fs::create_dir_all(&library_key).unwrap();
 
-        assert!(cache.exists(repo_path.to_string()));
+        assert!(library.exists(repo_path.to_string()));
     }
 
     #[test]
-    fn test_repo_cache_key_consistency() {
-        let cache = RepoCache {
-            path: "/cache".to_string(),
+    fn test_library_key_consistency() {
+        let library = Library {
+            path: "/library".to_string(),
         };
 
-        let key1 = cache.compute_cache_key("/same/path");
-        let key2 = cache.compute_cache_key("/same/path");
+        let key1 = library.compute_library_key("/same/path");
+        let key2 = library.compute_library_key("/same/path");
         assert_eq!(key1, key2);
 
-        let key3 = cache.compute_cache_key("/different/path");
+        let key3 = library.compute_library_key("/different/path");
         assert_ne!(key1, key3);
     }
 
@@ -585,81 +621,4 @@ mod tests {
         assert_eq!(pattern.full_path(), "user/repo");
     }
 
-    #[test]
-    fn test_workspace_from_path() {
-        use std::fs;
-
-        let temp_dir = TempDir::new().unwrap();
-        let workspace_path = temp_dir.path().join("workspace");
-        fs::create_dir_all(&workspace_path).unwrap();
-
-        let config = Config {
-            workspace: vec![
-                Workspace {
-                    name: Some("test".to_string()),
-                    path: workspace_path.to_string_lossy().to_string(),
-                    remotes: vec![],
-                },
-            ],
-            cache: None,
-        };
-
-        // Test path within workspace
-        let subdir = workspace_path.join("github.com/user/repo");
-        fs::create_dir_all(&subdir).unwrap();
-
-        let found_ws = config.workspace_from_path(&subdir);
-        assert!(found_ws.is_some());
-        assert_eq!(found_ws.unwrap().name, Some("test".to_string()));
-
-        // Test path outside workspace
-        let outside_path = temp_dir.path().join("outside");
-        fs::create_dir_all(&outside_path).unwrap();
-
-        let found_ws = config.workspace_from_path(&outside_path);
-        assert!(found_ws.is_none());
-    }
-
-    #[test]
-    fn test_workspace_from_path_multiple_workspaces() {
-        use std::fs;
-
-        let temp_dir = TempDir::new().unwrap();
-        let ws1_path = temp_dir.path().join("workspace1");
-        let ws2_path = temp_dir.path().join("workspace2");
-        fs::create_dir_all(&ws1_path).unwrap();
-        fs::create_dir_all(&ws2_path).unwrap();
-
-        let config = Config {
-            workspace: vec![
-                Workspace {
-                    name: Some("workspace1".to_string()),
-                    path: ws1_path.to_string_lossy().to_string(),
-                    remotes: vec![],
-                },
-                Workspace {
-                    name: Some("workspace2".to_string()),
-                    path: ws2_path.to_string_lossy().to_string(),
-                    remotes: vec![],
-                },
-            ],
-            cache: None,
-        };
-
-        // Test path in first workspace
-        let subdir1 = ws1_path.join("repos");
-        fs::create_dir_all(&subdir1).unwrap();
-
-        let found_ws = config.workspace_from_path(&subdir1);
-        assert!(found_ws.is_some());
-        assert_eq!(found_ws.unwrap().name, Some("workspace1".to_string()));
-
-        // Test path in second workspace
-        let subdir2 = ws2_path.join("repos");
-        fs::create_dir_all(&subdir2).unwrap();
-
-        let found_ws = config.workspace_from_path(&subdir2);
-        assert!(found_ws.is_some());
-        assert_eq!(found_ws.unwrap().name, Some("workspace2".to_string()));
-    }
 }

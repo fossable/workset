@@ -1,3 +1,4 @@
+use crate::Workspace;
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
@@ -15,7 +16,6 @@ use ratatui::{
 use std::io;
 
 use crate::remote::ListRepos;
-use crate::Config;
 
 pub struct App {
     repos: Vec<String>,
@@ -112,16 +112,14 @@ impl App {
     }
 }
 
-pub fn run_tui(config: &Config) -> Result<Option<String>> {
+pub fn run_tui(workspace: &Workspace) -> Result<Option<String>> {
     // Collect repositories from all configured remotes
     let mut all_repos = Vec::new();
 
-    for workspace in &config.workspace {
-        for remote in &workspace.remotes {
-            match remote.list_repo_paths() {
-                Ok(repos) => all_repos.extend(repos),
-                Err(e) => eprintln!("Warning: Failed to fetch repos from remote: {}", e),
-            }
+    for remote in &workspace.remotes {
+        match remote.list_repo_paths() {
+            Ok(repos) => all_repos.extend(repos),
+            Err(e) => eprintln!("Warning: Failed to fetch repos from remote: {}", e),
         }
     }
 

@@ -1,10 +1,10 @@
 [package]
-name = "wsx"
-description = "Cilki's WorkSpace eXplorer"
+name = "workset"
+description = "Manage git repos with worksets"
 version = "0.1.0"
 edition = "2021"
 authors = ["cilki"]
-repository = "https://github.com/cilki/wsx/"
+repository = "https://github.com/fossable/workset/"
 readme = "README.md"
 keywords = ["git", "workspace", "cli", "repository", "manager"]
 categories = ["command-line-utilities", "development-tools"]
@@ -14,7 +14,7 @@ anyhow = "1"
 cmd_lib = "1"
 crossterm = { version = "0.28", optional = true }
 enum_dispatch = "0.3"
-git-repository = { version = "0", optional = true }
+gix = "0.68"
 home = "0.5"
 log = "0.4"
 pico-args = "0.5"
@@ -45,5 +45,3 @@ default = ["github", "gitlab", "tui"]
 github = ["dep:serde_json"]
 gitlab = []
 tui = ["dep:crossterm", "dep:ratatui"]
-# Note: git_oxide feature currently has compilation issues with git-repository dependency
-git_oxide = ["dep:git-repository"]
