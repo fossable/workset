@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use cmd_lib::run_fun;
 use remote::{ListRepos, Remote};
 use serde::{Deserialize, Serialize};
@@ -205,16 +205,14 @@ pub fn check_uncommitted_changes(repo_path: &Path) -> Result<bool> {
     {
         Ok(mut iter) => {
             // Check if there are any untracked files
-            for item in iter.by_ref() {
-                if let Ok(entry) = item {
-                    // Check if this is an untracked file
-                    if matches!(
-                        entry,
-                        gix::status::index_worktree::iter::Item::DirectoryContents { .. }
-                    ) {
-                        debug!("Repository has untracked files: {}", repo_path.display());
-                        return Ok(true);
-                    }
+            for entry in iter.by_ref().flatten() {
+                // Check if this is an untracked file
+                if matches!(
+                    entry,
+                    gix::status::index_worktree::iter::Item::DirectoryContents { .. }
+                ) {
+                    debug!("Repository has untracked files: {}", repo_path.display());
+                    return Ok(true);
                 }
             }
         }
@@ -399,15 +397,6 @@ impl Workspace {
     /// Search the workspace for local repos matching the given pattern.
     pub fn search(&self, pattern: &RepoPattern) -> Result<Vec<PathBuf>> {
         let repos = find_git_repositories(&format!("{}/{}", self.path, pattern.full_path()))?;
-
-        // Try each remote if there were no matches immediately
-        // if repos.len() == 0 {
-        //     for remote in self.remotes.iter() {
-        //         let repos = find_git_dir(&format!("{}/{}/{}", self.path, remote.name(), pattern.full_path()))?;
-        //         if repos.len() == 0 {}
-        //     }
-        // }
-
         Ok(repos)
     }
 
@@ -651,7 +640,7 @@ impl Library {
         let dest = self.compute_library_key(&repo_path);
 
         // Verify the source .git directory exists
-        if !std::fs::metadata(&source).is_ok() {
+        if std::fs::metadata(&source).is_err() {
             bail!("Repository .git directory not found: {}", source);
         }
 
@@ -677,7 +666,7 @@ impl Library {
         let source = self.compute_library_key(&repo_path);
 
         // Verify the library entry exists
-        if !std::fs::metadata(&source).is_ok() {
+        if std::fs::metadata(&source).is_err() {
             bail!("Repository not found in library for path: {}", repo_path);
         }
 

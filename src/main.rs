@@ -2,8 +2,8 @@ use anyhow::Result;
 use std::io::Write;
 use tracing::level_filters::LevelFilter;
 use tracing::{error, info};
-use workset::remote::ListRepos;
 use workset::Workspace;
+use workset::remote::ListRepos;
 
 /// Build info provided by built crate.
 pub mod build_info {
@@ -55,14 +55,14 @@ fn main() -> Result<()> {
         println!("  <pattern>                            Add a repository to your working set");
         println!("  drop [pattern] [--delete] [--force]  Drop repository(ies) from workspace");
         println!(
-        "                                       Without pattern: drops all in current directory"
-    );
+            "                                       Without pattern: drops all in current directory"
+        );
         println!(
-        "                                       With --delete: permanently delete (don't store)"
-    );
+            "                                       With --delete: permanently delete (don't store)"
+        );
         println!(
-        "                                       With --force: drop even with uncommitted changes"
-    );
+            "                                       With --force: drop even with uncommitted changes"
+        );
         println!("  list, ls                             List all repositories with their status");
         println!("  status                               Show workspace summary and statistics");
         println!();
@@ -144,14 +144,11 @@ fn main() -> Result<()> {
             {
                 if let Some(workspace) = maybe_workspace {
                     // Open TUI for interactive repository selection
-                    match workset::tui::run_tui(&workspace)? {
-                        Some(repo) => {
-                            let pattern: workset::RepoPattern = repo
-                                .parse()
-                                .map_err(|e| anyhow::anyhow!("Failed to parse pattern: {}", e))?;
-                            workspace.open(workspace.library.as_ref(), &pattern)?;
-                        }
-                        None => (),
+                    if let Some(repo) = workset::tui::run_tui(&workspace)? {
+                        let pattern: workset::RepoPattern = repo
+                            .parse()
+                            .map_err(|e| anyhow::anyhow!("Failed to parse pattern: {}", e))?;
+                        workspace.open(workspace.library.as_ref(), &pattern)?;
                     }
                 } else {
                     error!("You're not in a workspace");
@@ -339,9 +336,9 @@ fn complete_fish(maybe_workspace: Option<Workspace>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use workset::Workspace;
     #[cfg(feature = "github")]
     use workset::remote::github::GithubRemote;
-    use workset::Workspace;
 
     #[test]
     #[cfg(feature = "github")]

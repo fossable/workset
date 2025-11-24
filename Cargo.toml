@@ -2,10 +2,11 @@
 name = "workset"
 description = "Manage git repos with worksets"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["cilki"]
 repository = "https://github.com/fossable/workset/"
 readme = "README.md"
+license = "Unlicense"
 keywords = ["git", "workspace", "cli", "repository", "manager"]
 categories = ["command-line-utilities", "development-tools"]
 

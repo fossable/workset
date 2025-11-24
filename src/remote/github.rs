@@ -39,11 +39,13 @@ impl ListRepos for GithubRemote {
         let output = run_fun!(
             gh repo list $user --json nameWithOwner,isFork,isArchived --limit 1000
         )
-        .context("Failed to run 'gh' command. Make sure GitHub CLI is installed and authenticated")?;
+        .context(
+            "Failed to run 'gh' command. Make sure GitHub CLI is installed and authenticated",
+        )?;
 
         // Parse JSON output
-        let repos: Vec<GithubRepo> = serde_json::from_str(&output)
-            .context("Failed to parse gh CLI output")?;
+        let repos: Vec<GithubRepo> =
+            serde_json::from_str(&output).context("Failed to parse gh CLI output")?;
 
         let mut all_repos = Vec::new();
 
@@ -111,8 +113,9 @@ mod tests {
                 "user": "testuser",
                 "include_forks": true,
                 "include_archived": true
-            }"#
-        ).unwrap();
+            }"#,
+        )
+        .unwrap();
         assert_eq!(remote.user, "testuser");
         assert!(remote.include_forks);
         assert!(remote.include_archived);

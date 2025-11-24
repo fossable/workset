@@ -3,15 +3,15 @@ use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
-    Frame, Terminal,
 };
 use std::io;
 
@@ -53,10 +53,7 @@ impl App {
             self.filtered_repos = self
                 .repos
                 .iter()
-                .filter(|r| {
-                    r.to_lowercase()
-                        .contains(&self.search_query.to_lowercase())
-                })
+                .filter(|r| r.to_lowercase().contains(&self.search_query.to_lowercase()))
                 .cloned()
                 .collect();
         }
@@ -228,17 +225,15 @@ fn ui(f: &mut Frame, app: &mut App) {
     let items: Vec<ListItem> = app
         .filtered_repos
         .iter()
-        .map(|repo| {
-            ListItem::new(Line::from(vec![Span::raw(repo)]))
-        })
+        .map(|repo| ListItem::new(Line::from(vec![Span::raw(repo)])))
         .collect();
 
     let items = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!("Repositories ({}/{})", app.filtered_repos.len(), app.repos.len())),
-        )
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            "Repositories ({}/{})",
+            app.filtered_repos.len(),
+            app.repos.len()
+        )))
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)

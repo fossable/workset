@@ -33,7 +33,8 @@ impl fmt::Display for GitlabRemote {
 
 impl Metadata for GitlabRemote {
     fn name(&self) -> String {
-        let domain = self.url
+        let domain = self
+            .url
             .strip_prefix("https://")
             .or_else(|| self.url.strip_prefix("http://"))
             .unwrap_or(&self.url);
@@ -46,7 +47,8 @@ impl ListRepos for GitlabRemote {
         use cmd_lib::run_fun;
 
         // Get domain for formatting paths
-        let domain = self.url
+        let domain = self
+            .url
             .strip_prefix("https://")
             .or_else(|| self.url.strip_prefix("http://"))
             .unwrap_or(&self.url);
@@ -65,7 +67,9 @@ impl ListRepos for GitlabRemote {
                 glab repo list --member --per-page 100
             )
         }
-        .context("Failed to run 'glab' command. Make sure GitLab CLI is installed and authenticated")?;
+        .context(
+            "Failed to run 'glab' command. Make sure GitLab CLI is installed and authenticated",
+        )?;
 
         // Parse the output - glab returns tab-separated values by default
         // Format: namespace/project\tdescription\t...
@@ -160,8 +164,9 @@ mod tests {
                 "url": "https://custom.gitlab.com",
                 "include_forks": true,
                 "include_archived": true
-            }"#
-        ).unwrap();
+            }"#,
+        )
+        .unwrap();
         assert_eq!(remote.user, "testuser");
         assert_eq!(remote.url, "https://custom.gitlab.com");
         assert!(remote.include_forks);
