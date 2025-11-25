@@ -2,7 +2,6 @@ use anyhow::{Result, bail};
 use cmd_lib::run_fun;
 use remote::{ListRepos, Remote};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha512};
 use std::error::Error;
 use std::path::Path;
 use std::path::PathBuf;
@@ -118,10 +117,10 @@ pub fn find_git_repositories(path: &str) -> Result<Vec<PathBuf>> {
         for entry in entries.filter_map(|e| e.ok()) {
             let entry_path = entry.path();
 
-            // Skip hidden directories except .git
+            // Skip .git directory itself (it's not a repo container)
             if let Some(name) = entry_path.file_name() {
                 let name_str = name.to_string_lossy();
-                if name_str.starts_with('.') && name_str != ".git" {
+                if name_str == ".git" {
                     continue;
                 }
             }
@@ -424,10 +423,12 @@ impl Workspace {
 
         // Check library and restore if found
         if let Some(library) = library {
-            let repo_path = format!("{}/{}", self.path, pattern.full_path());
-            if library.exists(repo_path.clone()) {
-                info!("📦 Restoring from library: {}", pattern.full_path());
-                library.restore(repo_path.clone())?;
+            let relative_path = pattern.full_path();
+            let repo_path = format!("{}/{}", self.path, relative_path);
+
+            if library.exists(relative_path.clone()) {
+                info!("📦 Restoring from library: {}", relative_path);
+                library.restore_to_workspace(&self.path, &relative_path)?;
 
                 // Fetch latest changes from upstream
                 info!("  🔄 Fetching latest changes...");
@@ -436,7 +437,7 @@ impl Workspace {
                     info!("  ⚠ Could not fetch updates (continuing anyway)");
                 }
 
-                info!("✓ Restored {}", pattern.full_path());
+                info!("✓ Restored {}", relative_path);
                 return Ok(PathBuf::from(repo_path));
             }
         }
@@ -503,9 +504,15 @@ impl Workspace {
 
             if !delete {
                 if let Some(library) = library {
-                    // Store the repository in the library
+                    // Store the repository in the library using workspace-relative path
                     info!("📦 Storing {} in library", repo.display());
-                    library.store(repo.to_string_lossy().to_string())?;
+                    let relative_path = repo
+                        .strip_prefix(&self.path)
+                        .unwrap_or(&repo)
+                        .to_string_lossy()
+                        .trim_start_matches('/')
+                        .to_string();
+                    library.store_from_workspace(&self.path, &relative_path)?;
                 }
             } else {
                 info!("🗑️  Permanently deleting {}", repo.display());
@@ -563,9 +570,15 @@ impl Workspace {
 
             if !delete {
                 if let Some(library) = library {
-                    // Store the repository in the library
+                    // Store the repository in the library using workspace-relative path
                     info!("📦 Storing {} in library", repo.display());
-                    library.store(repo.to_string_lossy().to_string())?;
+                    let relative_path = repo
+                        .strip_prefix(&self.path)
+                        .unwrap_or(&repo)
+                        .to_string_lossy()
+                        .trim_start_matches('/')
+                        .to_string();
+                    library.store_from_workspace(&self.path, &relative_path)?;
                 }
             } else {
                 info!("🗑️  Permanently deleting {}", repo.display());
@@ -628,7 +641,9 @@ pub struct Library {
 
 impl Library {
     /// Move the given repository into the library.
-    pub fn store(&self, repo_path: String) -> Result<()> {
+    /// workspace_path: the root path of the workspace
+    /// relative_path: the relative path of the repo within the workspace (e.g. "github.com/user/repo")
+    pub fn store_from_workspace(&self, workspace_path: &str, relative_path: &str) -> Result<()> {
         use tracing::debug;
 
         // Make sure the library directory exists first
@@ -636,8 +651,8 @@ impl Library {
             anyhow::anyhow!("Failed to create library directory {}: {}", self.path, e)
         })?;
 
-        let source = format!("{}/.git", repo_path);
-        let dest = self.compute_library_key(&repo_path);
+        let source = format!("{}/{}/.git", workspace_path, relative_path);
+        let dest = format!("{}/{}", self.path, relative_path);
 
         // Verify the source .git directory exists
         if std::fs::metadata(&source).is_err() {
@@ -648,6 +663,12 @@ impl Library {
             .map_err(|e| anyhow::anyhow!("Failed to configure repository as bare: {}", e))?;
 
         debug!(source = %source, dest = %dest, "Storing repository in library");
+
+        // Create parent directories in library if needed
+        if let Some(parent) = Path::new(&dest).parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("Failed to create library parent directory: {}", e))?;
+        }
 
         // Clear the library entry if it exists (for re-storing)
         if std::fs::metadata(&dest).is_ok() {
@@ -662,36 +683,32 @@ impl Library {
         Ok(())
     }
 
-    pub fn restore(&self, repo_path: String) -> Result<()> {
-        let source = self.compute_library_key(&repo_path);
+    /// Restore a repository from the library to the workspace.
+    /// workspace_path: the root path of the workspace
+    /// relative_path: the relative path of the repo within the workspace (e.g. "github.com/user/repo")
+    pub fn restore_to_workspace(&self, workspace_path: &str, relative_path: &str) -> Result<()> {
+        let source = format!("{}/{}", self.path, relative_path);
+        let dest = format!("{}/{}", workspace_path, relative_path);
 
         // Verify the library entry exists
         if std::fs::metadata(&source).is_err() {
-            bail!("Repository not found in library for path: {}", repo_path);
+            bail!("Repository not found in library for path: {}", relative_path);
         }
 
         // Create parent directory if needed
-        if let Some(parent) = Path::new(&repo_path).parent() {
+        if let Some(parent) = Path::new(&dest).parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| anyhow::anyhow!("Failed to create parent directory: {}", e))?;
         }
 
-        run_fun!(git clone $source $repo_path)
+        run_fun!(git clone $source $dest)
             .map_err(|e| anyhow::anyhow!("Failed to restore repository from library: {}", e))?;
 
         Ok(())
     }
 
     pub fn exists(&self, repo_path: String) -> bool {
-        std::fs::metadata(self.compute_library_key(&repo_path)).is_ok()
-    }
-
-    fn compute_library_key(&self, path: &str) -> String {
-        format!(
-            "{}/{:x}",
-            self.path,
-            Sha512::new().chain_update(path).finalize()
-        )
+        std::fs::metadata(format!("{}/{}", self.path, repo_path)).is_ok()
     }
 
     /// List all repositories in the library
@@ -704,19 +721,36 @@ impl Library {
 
         let mut repos = Vec::new();
 
-        for entry in std::fs::read_dir(&self.path)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                // Try to open as a git repository to verify
-                if let Ok(_repo) = gix::open(entry.path()) {
-                    // Try to get the original path from git config or other metadata
-                    // For now, just add the hash
-                    debug!("Found library entry: {}", entry.path().display());
-                    repos.push(entry.file_name().to_string_lossy().to_string());
+        // Recursively find all git repositories in the library
+        fn find_repos(base_path: &str, current_path: &Path, repos: &mut Vec<String>) -> Result<()> {
+            if current_path.is_dir() {
+                // Check if this is a bare git repository
+                if gix::open(current_path).is_ok() {
+                    // Get the relative path from the library base
+                    if let Ok(rel_path) = current_path.strip_prefix(base_path) {
+                        let repo_path = rel_path.to_string_lossy().to_string();
+                        if !repo_path.is_empty() {
+                            repos.push(repo_path);
+                        }
+                    }
+                    return Ok(()); // Don't recurse into git repos
+                }
+
+                // Recursively search subdirectories
+                if let Ok(entries) = std::fs::read_dir(current_path) {
+                    for entry in entries.filter_map(|e| e.ok()) {
+                        let path = entry.path();
+                        find_repos(base_path, &path, repos)?;
+                    }
                 }
             }
+            Ok(())
         }
 
+        find_repos(&self.path, Path::new(&self.path), &mut repos)?;
+
+        debug!("Found {} repositories in library", repos.len());
+        repos.sort();
         Ok(repos)
     }
 }
@@ -744,25 +778,11 @@ mod tests {
         let repo_path = "/test/repo";
         assert!(!library.exists(repo_path.to_string()));
 
-        // Create the library directory
-        let library_key = library.compute_library_key(repo_path);
-        fs::create_dir_all(&library_key).unwrap();
+        // Create the library directory using the normal path
+        let library_path = format!("{}{}", library.path, repo_path);
+        fs::create_dir_all(&library_path).unwrap();
 
         assert!(library.exists(repo_path.to_string()));
-    }
-
-    #[test]
-    fn test_library_key_consistency() {
-        let library = Library {
-            path: "/library".to_string(),
-        };
-
-        let key1 = library.compute_library_key("/same/path");
-        let key2 = library.compute_library_key("/same/path");
-        assert_eq!(key1, key2);
-
-        let key3 = library.compute_library_key("/different/path");
-        assert_ne!(key1, key3);
     }
 
     #[test]

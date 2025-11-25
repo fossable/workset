@@ -143,13 +143,8 @@ fn main() -> Result<()> {
             #[cfg(feature = "tui")]
             {
                 if let Some(workspace) = maybe_workspace {
-                    // Open TUI for interactive repository selection
-                    if let Some(repo) = workset::tui::run_tui(&workspace)? {
-                        let pattern: workset::RepoPattern = repo
-                            .parse()
-                            .map_err(|e| anyhow::anyhow!("Failed to parse pattern: {}", e))?;
-                        workspace.open(workspace.library.as_ref(), &pattern)?;
-                    }
+                    // Open TUI for interactive workspace management
+                    workset::tui::run_tui(&workspace)?;
                 } else {
                     error!("You're not in a workspace");
                 }
