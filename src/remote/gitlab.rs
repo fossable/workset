@@ -110,6 +110,24 @@ impl ListRepos for GitlabRemote {
     }
 }
 
+/// Fetch repository suggestions from GitLab CLI for TUI autocomplete
+pub fn get_suggestions() -> Vec<String> {
+    if let Ok(output) = std::process::Command::new("glab")
+        .args(["repo", "list", "--all", "--per-page", "100"])
+        .output()
+        && output.status.success() {
+        return String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                // glab output format is: "namespace/project"
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                parts.first().map(|repo| format!("gitlab.com/{}", repo))
+            })
+            .collect();
+    }
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
