@@ -24,6 +24,10 @@ pub struct RepoInfo {
     pub path: PathBuf,
     pub display_name: String,
     pub is_clean: bool,
+    /// Last modification time as human-readable string (e.g., "5 minutes ago")
+    pub last_modified: Option<String>,
+    /// Size on disk in human-readable format (e.g., "1.2 GB")
+    pub size: Option<String>,
 }
 
 #[derive(Clone)]
@@ -40,7 +44,12 @@ pub struct TreeNode {
 
 impl TreeNode {
     pub fn new_repo(repo: RepoInfo) -> Self {
-        let name = repo.display_name.split('/').next_back().unwrap_or(&repo.display_name).to_string();
+        let name = repo
+            .display_name
+            .split('/')
+            .next_back()
+            .unwrap_or(&repo.display_name)
+            .to_string();
         Self {
             name,
             repo_info: Some(repo),
@@ -59,7 +68,12 @@ impl TreeNode {
     }
 
     /// Flatten the tree into a list of (node, depth, index_path, full_path) tuples
-    pub fn flatten(&self, depth: usize, index_path: Vec<usize>, parent_path: &str) -> Vec<(TreeNode, usize, Vec<usize>, String)> {
+    pub fn flatten(
+        &self,
+        depth: usize,
+        index_path: Vec<usize>,
+        parent_path: &str,
+    ) -> Vec<(TreeNode, usize, Vec<usize>, String)> {
         // Build the full path for this node
         let full_path = if parent_path.is_empty() {
             if let Some(ref repo) = self.repo_info {
@@ -158,7 +172,10 @@ pub fn build_tree(repos: Vec<RepoInfo>) -> Vec<TreeNode> {
 }
 
 /// Build library tree, excluding repos that exist in workspace
-pub fn build_library_tree(library_repos: Vec<String>, workspace_repos: &[RepoInfo]) -> Vec<TreeNode> {
+pub fn build_library_tree(
+    library_repos: Vec<String>,
+    workspace_repos: &[RepoInfo],
+) -> Vec<TreeNode> {
     let workspace_paths: std::collections::HashSet<_> = workspace_repos
         .iter()
         .map(|r| r.display_name.as_str())
@@ -170,7 +187,9 @@ pub fn build_library_tree(library_repos: Vec<String>, workspace_repos: &[RepoInf
         .map(|path| RepoInfo {
             path: PathBuf::from(&path),
             display_name: path.clone(),
-            is_clean: true,  // Library repos are always considered clean
+            is_clean: true,      // Library repos are always considered clean
+            last_modified: None, // Will be computed asynchronously
+            size: None,          // Will be computed asynchronously
         })
         .collect();
 

@@ -77,9 +77,19 @@ struct GithubRepo {
 /// Fetch repository suggestions from GitHub CLI for TUI autocomplete
 pub fn get_suggestions() -> Vec<String> {
     if let Ok(output) = std::process::Command::new("gh")
-        .args(["repo", "list", "--limit", "100", "--json", "nameWithOwner", "-q", ".[].nameWithOwner"])
+        .args([
+            "repo",
+            "list",
+            "--limit",
+            "100",
+            "--json",
+            "nameWithOwner",
+            "-q",
+            ".[].nameWithOwner",
+        ])
         .output()
-        && output.status.success() {
+        && output.status.success()
+    {
         return String::from_utf8_lossy(&output.stdout)
             .lines()
             .map(|line| format!("github.com/{}", line.trim()))

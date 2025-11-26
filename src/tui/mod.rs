@@ -1,14 +1,16 @@
 mod app;
+mod metadata;
 mod tree;
 
 use app::{App, AppMode, Section};
+use metadata::{format_size, format_time_ago, get_repo_modification_time, get_repo_size};
 use tree::RepoInfo;
 
-use crate::{Workspace, check_uncommitted_changes, check_unpushed_commits, find_git_repositories};
 #[cfg(feature = "github")]
 use crate::remote::github;
 #[cfg(feature = "gitlab")]
 use crate::remote::gitlab;
+use crate::{Workspace, check_repo_status, find_git_repositories};
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -19,7 +21,7 @@ use fuzzy_matcher::FuzzyMatcher;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Alignment},
+    layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
@@ -54,7 +56,11 @@ impl LogCapture {
     }
 
     pub fn get_message(&self) -> String {
-        self.last_message.lock().ok().map(|m| m.clone()).unwrap_or_default()
+        self.last_message
+            .lock()
+            .ok()
+            .map(|m| m.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -64,6 +70,57 @@ enum Action {
     DropToLibrary(Vec<String>),
     RestoreFromLibrary(Vec<String>),
     AddRepo(String),
+}
+
+/// Message for updating repository metadata asynchronously
+enum MetadataUpdate {
+    WorkspaceTime {
+        display_name: String,
+        time_ago: String,
+    },
+    LibrarySize {
+        display_name: String,
+        size: String,
+    },
+}
+
+/// Spawn background workers to compute repository metadata
+fn spawn_metadata_workers(
+    workspace_repos: Vec<RepoInfo>,
+    library_repos: Vec<String>,
+    library_path: Option<String>,
+    tx: std::sync::mpsc::Sender<MetadataUpdate>,
+) {
+    // Spawn worker for workspace modification times
+    let tx_workspace = tx.clone();
+    std::thread::spawn(move || {
+        for repo in workspace_repos {
+            if let Ok(mod_time) = get_repo_modification_time(&repo.path, repo.is_clean) {
+                let time_ago = format_time_ago(mod_time);
+                let _ = tx_workspace.send(MetadataUpdate::WorkspaceTime {
+                    display_name: repo.display_name.clone(),
+                    time_ago,
+                });
+            }
+        }
+    });
+
+    // Spawn worker for library sizes
+    std::thread::spawn(move || {
+        if let Some(base_path) = library_path {
+            for repo_relative_path in library_repos {
+                // Combine library base path with relative path
+                let repo_path = PathBuf::from(&base_path).join(&repo_relative_path);
+                if let Ok(size_bytes) = get_repo_size(&repo_path) {
+                    let size = format_size(size_bytes);
+                    let _ = tx.send(MetadataUpdate::LibrarySize {
+                        display_name: repo_relative_path.clone(),
+                        size,
+                    });
+                }
+            }
+        }
+    });
 }
 
 /// Detect the parent shell by reading /proc/self/status
@@ -82,10 +139,9 @@ fn detect_parent_shell() -> Option<String> {
         // Check if it's a known shell
         if matches!(shell_name, "fish" | "bash" | "zsh" | "sh" | "dash" | "ksh") {
             // Find the full path to this shell
-            if let Ok(output) = std::process::Command::new("which")
-                .arg(shell_name)
-                .output()
-                && output.status.success() {
+            if let Ok(output) = std::process::Command::new("which").arg(shell_name).output()
+                && output.status.success()
+            {
                 return Some(String::from_utf8_lossy(&output.stdout).trim().to_string());
             }
             // Fallback to just the shell name
@@ -99,13 +155,12 @@ fn detect_parent_shell() -> Option<String> {
     }
 }
 
-
 pub fn run_tui(workspace: &Workspace) -> Result<()> {
     let log_capture = LogCapture::new();
 
     loop {
         // Collect workspace repositories
-        let workspace_repos = find_git_repositories(&workspace.path)?
+        let workspace_repos: Vec<RepoInfo> = find_git_repositories(&workspace.path)?
             .into_iter()
             .map(|path| {
                 let display_name = path
@@ -116,23 +171,29 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                     .trim_start_matches('/')
                     .to_string();
 
-                let has_changes = check_uncommitted_changes(&path).unwrap_or(false);
-                let has_unpushed = check_unpushed_commits(&path).unwrap_or(false);
-                let is_clean = !has_changes && !has_unpushed;
+                // Check repo status in a single pass for performance
+                let status = check_repo_status(&path).unwrap_or_default();
+                // A repo is only clean if it has commits, no changes, and no unpushed commits
+                let is_clean = status.has_commits && !status.has_changes && !status.has_unpushed;
 
                 RepoInfo {
                     path,
                     display_name,
                     is_clean,
+                    last_modified: None, // Will be computed asynchronously
+                    size: None,          // Will be computed asynchronously
                 }
             })
             .collect();
 
-        // Collect library repositories
-        let library_repos = if let Some(library) = &workspace.library {
-            library.list().unwrap_or_default()
+        // Collect library repositories and path
+        let (library_repos, library_path) = if let Some(library) = &workspace.library {
+            (
+                library.list().unwrap_or_default(),
+                Some(library.path.clone()),
+            )
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
 
         // Setup terminal
@@ -142,9 +203,17 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        // Create app and run
-        let mut app = App::new(workspace_repos, library_repos);
-        let action = run_app(&mut terminal, &mut app, log_capture.clone())?;
+        // Create app
+        let mut app = App::new(workspace_repos.clone(), library_repos.clone());
+
+        // Create channel for metadata updates
+        let (metadata_tx, metadata_rx) = std::sync::mpsc::channel::<MetadataUpdate>();
+
+        // Spawn background threads to compute metadata
+        spawn_metadata_workers(workspace_repos, library_repos, library_path, metadata_tx);
+
+        // Run app with metadata receiver
+        let action = run_app(&mut terminal, &mut app, log_capture.clone(), metadata_rx)?;
 
         // Restore terminal
         disable_raw_mode()?;
@@ -191,7 +260,10 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                     let pattern: RepoPattern = match repo_path.parse() {
                         Ok(p) => p,
                         Err(e) => {
-                            log_capture.set_message(format!("✗ Failed to parse pattern {}: {}", repo_path, e));
+                            log_capture.set_message(format!(
+                                "✗ Failed to parse pattern {}: {}",
+                                repo_path, e
+                            ));
                             error_count += 1;
                             continue;
                         }
@@ -200,16 +272,21 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                     match workspace.drop(workspace.library.as_ref(), &pattern, false, false) {
                         Ok(_) => success_count += 1,
                         Err(e) => {
-                            log_capture.set_message(format!("✗ Failed to drop {}: {}", repo_path, e));
+                            log_capture
+                                .set_message(format!("✗ Failed to drop {}: {}", repo_path, e));
                             error_count += 1;
                         }
                     }
                 }
 
                 if error_count == 0 {
-                    log_capture.set_message(format!("✓ Dropped {} repo(s) to library", success_count));
+                    log_capture
+                        .set_message(format!("✓ Dropped {} repo(s) to library", success_count));
                 } else {
-                    log_capture.set_message(format!("⚠ Dropped {} repo(s), {} failed", success_count, error_count));
+                    log_capture.set_message(format!(
+                        "⚠ Dropped {} repo(s), {} failed",
+                        success_count, error_count
+                    ));
                 }
 
                 // Loop back to refresh TUI
@@ -235,16 +312,21 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                     match result {
                         Ok(_) => success_count += 1,
                         Err(e) => {
-                            log_capture.set_message(format!("✗ Failed to restore {}: {}", repo_path, e));
+                            log_capture
+                                .set_message(format!("✗ Failed to restore {}: {}", repo_path, e));
                             error_count += 1;
                         }
                     }
                 }
 
                 if error_count == 0 {
-                    log_capture.set_message(format!("✓ Restored {} repo(s) from library", success_count));
+                    log_capture
+                        .set_message(format!("✓ Restored {} repo(s) from library", success_count));
                 } else {
-                    log_capture.set_message(format!("⚠ Restored {} repo(s), {} failed", success_count, error_count));
+                    log_capture.set_message(format!(
+                        "⚠ Restored {} repo(s), {} failed",
+                        success_count, error_count
+                    ));
                 }
 
                 // Loop back to refresh TUI
@@ -264,7 +346,9 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
 
                 // Add the repository
                 match workspace.open(workspace.library.as_ref(), &pattern) {
-                    Ok(_) => log_capture.set_message(format!("✓ Added repository {}", repo_pattern)),
+                    Ok(_) => {
+                        log_capture.set_message(format!("✓ Added repository {}", repo_pattern))
+                    }
                     Err(e) => log_capture.set_message(format!("✗ Failed to add: {}", e)),
                 }
 
@@ -281,23 +365,43 @@ fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     log_capture: LogCapture,
+    metadata_rx: std::sync::mpsc::Receiver<MetadataUpdate>,
 ) -> Result<Action> {
     loop {
         // Update the app with the latest log message
         app.last_log_message = log_capture.get_message();
 
+        // Check for metadata updates (non-blocking)
+        while let Ok(update) = metadata_rx.try_recv() {
+            match update {
+                MetadataUpdate::WorkspaceTime {
+                    display_name,
+                    time_ago,
+                } => {
+                    app.update_workspace_metadata(&display_name, Some(time_ago), None);
+                }
+                MetadataUpdate::LibrarySize { display_name, size } => {
+                    app.update_library_metadata(&display_name, size);
+                }
+            }
+        }
+
         terminal.draw(|f| ui(f, app))?;
 
-        if let Event::Key(key) = event::read()? {
+        // Use poll with timeout to allow checking for metadata updates periodically
+        if event::poll(std::time::Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+        {
             match app.mode {
                 AppMode::Normal => match key.code {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(Action::None)
+                        return Ok(Action::None);
                     }
                     KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         // Ctrl+D = drop workspace repo(s) to library
                         if app.active_section == Section::Workspace
-                            && let Some(node) = app.selected_workspace_node() {
+                            && let Some(node) = app.selected_workspace_node()
+                        {
                             let repo_paths = node.collect_repo_paths();
                             if !repo_paths.is_empty() {
                                 return Ok(Action::DropToLibrary(repo_paths));
@@ -407,9 +511,13 @@ fn run_app<B: ratatui::backend::Backend>(
                         // Use selected suggestion or manual input
                         let repo = if let Some(idx) = app.add_repo_state.selected() {
                             // Filter suggestions by current input
-                            let filtered: Vec<_> = app.add_repo_suggestions
+                            let filtered: Vec<_> = app
+                                .add_repo_suggestions
                                 .iter()
-                                .filter(|s| s.to_lowercase().contains(&app.add_repo_input.to_lowercase()))
+                                .filter(|s| {
+                                    s.to_lowercase()
+                                        .contains(&app.add_repo_input.to_lowercase())
+                                })
                                 .collect();
 
                             filtered.get(idx).map(|s| s.to_string())
@@ -425,9 +533,13 @@ fn run_app<B: ratatui::backend::Backend>(
                         }
                     }
                     KeyCode::Down => {
-                        let filtered: Vec<_> = app.add_repo_suggestions
+                        let filtered: Vec<_> = app
+                            .add_repo_suggestions
                             .iter()
-                            .filter(|s| s.to_lowercase().contains(&app.add_repo_input.to_lowercase()))
+                            .filter(|s| {
+                                s.to_lowercase()
+                                    .contains(&app.add_repo_input.to_lowercase())
+                            })
                             .collect();
 
                         if !filtered.is_empty() {
@@ -440,9 +552,13 @@ fn run_app<B: ratatui::backend::Backend>(
                         }
                     }
                     KeyCode::Up => {
-                        let filtered: Vec<_> = app.add_repo_suggestions
+                        let filtered: Vec<_> = app
+                            .add_repo_suggestions
                             .iter()
-                            .filter(|s| s.to_lowercase().contains(&app.add_repo_input.to_lowercase()))
+                            .filter(|s| {
+                                s.to_lowercase()
+                                    .contains(&app.add_repo_input.to_lowercase())
+                            })
                             .collect();
 
                         if !filtered.is_empty() {
@@ -478,10 +594,10 @@ fn ui(f: &mut Frame, app: &mut App) {
     let vertical_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),       // Help (at top)
-            Constraint::Min(0),          // Main area (workspace + library side by side)
-            Constraint::Length(3),       // Search box
-            Constraint::Length(1),       // Status/log message (at bottom)
+            Constraint::Length(1), // Help (at top)
+            Constraint::Min(0),    // Main area (workspace + library side by side)
+            Constraint::Length(3), // Search box
+            Constraint::Length(1), // Status/log message (at bottom)
         ])
         .split(f.area());
 
@@ -489,51 +605,113 @@ fn ui(f: &mut Frame, app: &mut App) {
     let horizontal_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(50),  // Workspace (left)
-            Constraint::Percentage(50),  // Library (right)
+            Constraint::Percentage(50), // Workspace (left)
+            Constraint::Percentage(50), // Library (right)
         ])
         .split(vertical_chunks[1]);
 
     // Help text (at top)
     let help_spans = if app.active_section == Section::Workspace {
         vec![
-            Span::styled("Tab", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Tab",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" switch  "),
-            Span::styled("↑/↓", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "↑/↓",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" navigate  "),
-            Span::styled("←/→", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "←/→",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" expand/collapse  "),
-            Span::styled("Enter", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" open  "),
-            Span::styled("Ctrl+D", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Ctrl+D",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" drop  "),
-            Span::styled("Esc", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Esc",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" quit"),
         ]
     } else if app.active_section == Section::Library {
         vec![
-            Span::styled("Tab", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Tab",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" switch  "),
-            Span::styled("↑/↓", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "↑/↓",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" navigate  "),
-            Span::styled("←/→", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "←/→",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" expand/collapse  "),
-            Span::styled("Enter", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" restore  "),
-            Span::styled("Ctrl+A", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Ctrl+A",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" add  "),
-            Span::styled("Esc", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Esc",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" quit"),
         ]
     } else {
         vec![
-            Span::styled("Esc", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Esc",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" quit"),
         ]
     };
-    let help = Paragraph::new(Line::from(help_spans))
-        .alignment(Alignment::Center);
+    let help = Paragraph::new(Line::from(help_spans)).alignment(Alignment::Center);
     f.render_widget(help, vertical_chunks[0]);
+
+    // Calculate available width for workspace panel (minus borders and padding)
+    // Account for: 2 for borders, 2 for highlight symbol ">> ", 1 for padding on right
+    let workspace_width = horizontal_chunks[0].width.saturating_sub(5) as usize;
 
     // Workspace repositories (tree)
     let workspace_flat = app.get_flattened_workspace();
@@ -551,7 +729,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             if !node.children.is_empty() {
                 spans.push(Span::styled(
                     if node.expanded { "▼ " } else { "▶ " },
-                    Style::default().fg(Color::Cyan)
+                    Style::default().fg(Color::Cyan),
                 ));
             } else if *depth > 0 {
                 spans.push(Span::raw("  "));
@@ -573,59 +751,66 @@ fn ui(f: &mut Frame, app: &mut App) {
                     && app.search_query.contains(&format!("{}/", node.name));
 
                 // Try to match against the full path for this node
-                if should_highlight_dir || app.matcher.fuzzy_indices(full_path, &app.search_query).is_some() {
-                    if let Some((_, indices)) = app.matcher.fuzzy_indices(full_path, &app.search_query) {
-                    let mut last_pos = 0;
-                    let chars: Vec<(usize, char)> = node.name.char_indices().collect();
+                if should_highlight_dir
+                    || app
+                        .matcher
+                        .fuzzy_indices(full_path, &app.search_query)
+                        .is_some()
+                {
+                    if let Some((_, indices)) =
+                        app.matcher.fuzzy_indices(full_path, &app.search_query)
+                    {
+                        let mut last_pos = 0;
+                        let chars: Vec<(usize, char)> = node.name.char_indices().collect();
 
-                    // Find which indices apply to just the node name (not full path)
-                    let path_offset = full_path.len() - node.name.len();
+                        // Find which indices apply to just the node name (not full path)
+                        let path_offset = full_path.len() - node.name.len();
 
-                    for &match_idx in &indices {
-                        if match_idx < path_offset {
-                            continue; // Skip matches in path prefix
+                        for &match_idx in &indices {
+                            if match_idx < path_offset {
+                                continue; // Skip matches in path prefix
+                            }
+                            let local_idx = match_idx - path_offset;
+
+                            if local_idx >= chars.len() {
+                                continue;
+                            }
+
+                            // Add unmatched text before this character
+                            if local_idx > last_pos {
+                                let start_byte = chars[last_pos].0;
+                                let end_byte = chars[local_idx].0;
+                                spans.push(Span::raw(&node.name[start_byte..end_byte]));
+                            }
+
+                            // Add highlighted character
+                            let char_byte_start = chars[local_idx].0;
+                            let char_byte_end = if local_idx + 1 < chars.len() {
+                                chars[local_idx + 1].0
+                            } else {
+                                node.name.len()
+                            };
+                            spans.push(Span::styled(
+                                &node.name[char_byte_start..char_byte_end],
+                                Style::default().fg(Color::Black).bg(Color::Yellow),
+                            ));
+
+                            last_pos = local_idx + 1;
                         }
-                        let local_idx = match_idx - path_offset;
 
-                        if local_idx >= chars.len() {
-                            continue;
-                        }
-
-                        // Add unmatched text before this character
-                        if local_idx > last_pos {
+                        // Add remaining text
+                        if last_pos < chars.len() {
                             let start_byte = chars[last_pos].0;
-                            let end_byte = chars[local_idx].0;
-                            spans.push(Span::raw(&node.name[start_byte..end_byte]));
+                            spans.push(Span::raw(&node.name[start_byte..]));
+                        } else if last_pos == 0 {
+                            // No matches in name portion, show normally
+                            spans.push(Span::raw(&node.name));
                         }
-
-                        // Add highlighted character
-                        let char_byte_start = chars[local_idx].0;
-                        let char_byte_end = if local_idx + 1 < chars.len() {
-                            chars[local_idx + 1].0
-                        } else {
-                            node.name.len()
-                        };
-                        spans.push(Span::styled(
-                            &node.name[char_byte_start..char_byte_end],
-                            Style::default().fg(Color::Black).bg(Color::Yellow)
-                        ));
-
-                        last_pos = local_idx + 1;
-                    }
-
-                    // Add remaining text
-                    if last_pos < chars.len() {
-                        let start_byte = chars[last_pos].0;
-                        spans.push(Span::raw(&node.name[start_byte..]));
-                    } else if last_pos == 0 {
-                        // No matches in name portion, show normally
-                        spans.push(Span::raw(&node.name));
-                    }
                     } else if should_highlight_dir {
                         // Directory is part of search path, highlight entire name
                         spans.push(Span::styled(
                             &node.name,
-                            Style::default().fg(Color::Black).bg(Color::Yellow)
+                            Style::default().fg(Color::Black).bg(Color::Yellow),
                         ));
                     }
                 } else {
@@ -635,20 +820,42 @@ fn ui(f: &mut Frame, app: &mut App) {
                 spans.push(Span::raw(&node.name));
             }
 
+            // Calculate current text width (accounting for unicode characters)
+            let mut text_width = 0;
+            for span in &spans {
+                text_width += span.content.chars().count();
+            }
+
+            // Add modification time for workspace repos (right-aligned if available)
+            if let Some(ref repo) = node.repo_info
+                && let Some(ref time_str) = repo.last_modified
+            {
+                let metadata_width = time_str.chars().count();
+                // Calculate padding needed to right-align (ensure at least 1 space)
+                let padding_needed = workspace_width
+                    .saturating_sub(text_width)
+                    .saturating_sub(metadata_width)
+                    .max(1);
+                spans.push(Span::raw(" ".repeat(padding_needed)));
+                spans.push(Span::styled(time_str, Style::default().fg(Color::DarkGray)));
+            }
+
             ListItem::new(Line::from(spans))
         })
         .collect();
 
     let workspace_repo_count = app.count_workspace_repos();
     let workspace_list = List::new(workspace_items)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .title(format!("Workspace ({})", workspace_repo_count))
-            .border_style(if app.active_section == Section::Workspace {
-                Style::default().fg(Color::Cyan)
-            } else {
-                Style::default()
-            }))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Workspace ({})", workspace_repo_count))
+                .border_style(if app.active_section == Section::Workspace {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default()
+                }),
+        )
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
@@ -660,6 +867,10 @@ fn ui(f: &mut Frame, app: &mut App) {
     let mut ws_list_state = ratatui::widgets::ListState::default();
     ws_list_state.select(app.workspace_state.selected());
     f.render_stateful_widget(workspace_list, horizontal_chunks[0], &mut ws_list_state);
+
+    // Calculate available width for library panel (minus borders and padding)
+    // Account for: 2 for borders, 2 for highlight symbol ">> ", 1 for padding on right
+    let library_width = horizontal_chunks[1].width.saturating_sub(5) as usize;
 
     // Library repositories (tree)
     let library_flat = app.get_flattened_library();
@@ -677,7 +888,7 @@ fn ui(f: &mut Frame, app: &mut App) {
             if !node.children.is_empty() {
                 spans.push(Span::styled(
                     if node.expanded { "▼ " } else { "▶ " },
-                    Style::default().fg(Color::Cyan)
+                    Style::default().fg(Color::Cyan),
                 ));
             } else if *depth > 0 {
                 spans.push(Span::raw("  "));
@@ -692,59 +903,66 @@ fn ui(f: &mut Frame, app: &mut App) {
                     && app.search_query.contains(&format!("{}/", node.name));
 
                 // Try to match against the full path for this node
-                if should_highlight_dir || app.matcher.fuzzy_indices(full_path, &app.search_query).is_some() {
-                    if let Some((_, indices)) = app.matcher.fuzzy_indices(full_path, &app.search_query) {
-                    let mut last_pos = 0;
-                    let chars: Vec<(usize, char)> = node.name.char_indices().collect();
+                if should_highlight_dir
+                    || app
+                        .matcher
+                        .fuzzy_indices(full_path, &app.search_query)
+                        .is_some()
+                {
+                    if let Some((_, indices)) =
+                        app.matcher.fuzzy_indices(full_path, &app.search_query)
+                    {
+                        let mut last_pos = 0;
+                        let chars: Vec<(usize, char)> = node.name.char_indices().collect();
 
-                    // Find which indices apply to just the node name (not full path)
-                    let path_offset = full_path.len() - node.name.len();
+                        // Find which indices apply to just the node name (not full path)
+                        let path_offset = full_path.len() - node.name.len();
 
-                    for &match_idx in &indices {
-                        if match_idx < path_offset {
-                            continue; // Skip matches in path prefix
+                        for &match_idx in &indices {
+                            if match_idx < path_offset {
+                                continue; // Skip matches in path prefix
+                            }
+                            let local_idx = match_idx - path_offset;
+
+                            if local_idx >= chars.len() {
+                                continue;
+                            }
+
+                            // Add unmatched text before this character
+                            if local_idx > last_pos {
+                                let start_byte = chars[last_pos].0;
+                                let end_byte = chars[local_idx].0;
+                                spans.push(Span::raw(&node.name[start_byte..end_byte]));
+                            }
+
+                            // Add highlighted character
+                            let char_byte_start = chars[local_idx].0;
+                            let char_byte_end = if local_idx + 1 < chars.len() {
+                                chars[local_idx + 1].0
+                            } else {
+                                node.name.len()
+                            };
+                            spans.push(Span::styled(
+                                &node.name[char_byte_start..char_byte_end],
+                                Style::default().fg(Color::Black).bg(Color::Yellow),
+                            ));
+
+                            last_pos = local_idx + 1;
                         }
-                        let local_idx = match_idx - path_offset;
 
-                        if local_idx >= chars.len() {
-                            continue;
-                        }
-
-                        // Add unmatched text before this character
-                        if local_idx > last_pos {
+                        // Add remaining text
+                        if last_pos < chars.len() {
                             let start_byte = chars[last_pos].0;
-                            let end_byte = chars[local_idx].0;
-                            spans.push(Span::raw(&node.name[start_byte..end_byte]));
+                            spans.push(Span::raw(&node.name[start_byte..]));
+                        } else if last_pos == 0 {
+                            // No matches in name portion, show normally
+                            spans.push(Span::raw(&node.name));
                         }
-
-                        // Add highlighted character
-                        let char_byte_start = chars[local_idx].0;
-                        let char_byte_end = if local_idx + 1 < chars.len() {
-                            chars[local_idx + 1].0
-                        } else {
-                            node.name.len()
-                        };
-                        spans.push(Span::styled(
-                            &node.name[char_byte_start..char_byte_end],
-                            Style::default().fg(Color::Black).bg(Color::Yellow)
-                        ));
-
-                        last_pos = local_idx + 1;
-                    }
-
-                    // Add remaining text
-                    if last_pos < chars.len() {
-                        let start_byte = chars[last_pos].0;
-                        spans.push(Span::raw(&node.name[start_byte..]));
-                    } else if last_pos == 0 {
-                        // No matches in name portion, show normally
-                        spans.push(Span::raw(&node.name));
-                    }
                     } else if should_highlight_dir {
                         // Directory is part of search path, highlight entire name
                         spans.push(Span::styled(
                             &node.name,
-                            Style::default().fg(Color::Black).bg(Color::Yellow)
+                            Style::default().fg(Color::Black).bg(Color::Yellow),
                         ));
                     }
                 } else {
@@ -754,20 +972,42 @@ fn ui(f: &mut Frame, app: &mut App) {
                 spans.push(Span::raw(&node.name));
             }
 
+            // Calculate current text width (accounting for unicode characters)
+            let mut text_width = 0;
+            for span in &spans {
+                text_width += span.content.chars().count();
+            }
+
+            // Add size for library repos (right-aligned if available)
+            if let Some(ref repo) = node.repo_info
+                && let Some(ref size_str) = repo.size
+            {
+                let metadata_width = size_str.chars().count();
+                // Calculate padding needed to right-align (ensure at least 1 space)
+                let padding_needed = library_width
+                    .saturating_sub(text_width)
+                    .saturating_sub(metadata_width)
+                    .max(1);
+                spans.push(Span::raw(" ".repeat(padding_needed)));
+                spans.push(Span::styled(size_str, Style::default().fg(Color::DarkGray)));
+            }
+
             ListItem::new(Line::from(spans))
         })
         .collect();
 
     let library_repo_count = app.count_library_repos();
     let library_list = List::new(library_items)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .title(format!("Library ({})", library_repo_count))
-            .border_style(if app.active_section == Section::Library {
-                Style::default().fg(Color::Cyan)
-            } else {
-                Style::default()
-            }))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Library ({})", library_repo_count))
+                .border_style(if app.active_section == Section::Library {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default()
+                }),
+        )
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
@@ -795,10 +1035,12 @@ fn ui(f: &mut Frame, app: &mut App) {
     let search = Paragraph::new(search_text)
         .style(search_style)
         .alignment(Alignment::Left)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .border_style(search_border_style)
-            .title("Search"));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(search_border_style)
+                .title("Search"),
+        );
     f.render_widget(search, vertical_chunks[2]);
 
     // Status/log message (at bottom)
@@ -842,8 +1084,8 @@ fn render_add_repo_dialog(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Input box
-            Constraint::Min(0),     // Suggestions
+            Constraint::Length(3), // Input box
+            Constraint::Min(0),    // Suggestions
         ])
         .split(inner);
 
@@ -851,19 +1093,23 @@ fn render_add_repo_dialog(f: &mut Frame, app: &App) {
     let input_text = format!("{}_", app.add_repo_input);
     let input = Paragraph::new(input_text)
         .style(Style::default().fg(Color::Yellow))
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .title("Repository (e.g. github.com/user/repo)"));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Repository (e.g. github.com/user/repo)"),
+        );
     f.render_widget(input, chunks[0]);
 
     // Suggestions list
-    let filtered_suggestions: Vec<_> = app.add_repo_suggestions
+    let filtered_suggestions: Vec<_> = app
+        .add_repo_suggestions
         .iter()
         .filter(|s| {
             if app.add_repo_input.is_empty() {
                 true
             } else {
-                s.to_lowercase().contains(&app.add_repo_input.to_lowercase())
+                s.to_lowercase()
+                    .contains(&app.add_repo_input.to_lowercase())
             }
         })
         .collect();
@@ -874,13 +1120,15 @@ fn render_add_repo_dialog(f: &mut Frame, app: &App) {
         .collect();
 
     let suggestions = List::new(suggestion_items)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .title(format!("Suggestions ({})", filtered_suggestions.len())))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Suggestions ({})", filtered_suggestions.len())),
+        )
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol(">> ");
 

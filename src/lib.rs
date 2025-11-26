@@ -227,6 +227,154 @@ pub fn check_uncommitted_changes(repo_path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// Repository status information
+#[derive(Debug, Default)]
+pub struct RepoStatus {
+    pub has_changes: bool,
+    pub has_unpushed: bool,
+    pub has_commits: bool,
+}
+
+/// Check repository status (commits, changes, unpushed) in a single pass
+pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
+    let mut status = RepoStatus::default();
+
+    let repo = match gix::open(repo_path) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(
+                "Failed to open repository at {}: {}",
+                repo_path.display(),
+                e
+            );
+            return Ok(status);
+        }
+    };
+
+    // Check if repo has commits
+    match repo.head() {
+        Ok(head) => {
+            match head.try_into_referent() {
+                Some(head_ref) => {
+                    status.has_commits = true;
+
+                    // Check for unpushed commits
+                    let local_branch = head_ref.name();
+                    let remote_ref_name = match repo
+                        .branch_remote_ref_name(local_branch, gix::remote::Direction::Fetch)
+                    {
+                        Some(Ok(name)) => name,
+                        Some(Err(e)) => {
+                            debug!("Failed to get remote ref: {}", e);
+                            return Ok(status); // Can't check unpushed, but we have commits
+                        }
+                        None => {
+                            debug!("No upstream branch configured");
+                            return Ok(status); // No upstream, can't check unpushed
+                        }
+                    };
+
+                    // Try to find the remote ref
+                    match repo.find_reference(remote_ref_name.as_ref()) {
+                        Ok(remote_ref) => {
+                            let local_commit = match head_ref.id().object() {
+                                Ok(obj) => obj.id,
+                                Err(e) => {
+                                    warn!("Failed to get local commit: {}", e);
+                                    return Ok(status);
+                                }
+                            };
+
+                            let remote_commit = match remote_ref.id().object() {
+                                Ok(obj) => obj.id,
+                                Err(e) => {
+                                    warn!("Failed to get remote commit: {}", e);
+                                    return Ok(status);
+                                }
+                            };
+
+                            // If commits are different, we might have unpushed commits
+                            if local_commit != remote_commit {
+                                status.has_unpushed = true;
+                            }
+                        }
+                        Err(_) => {
+                            debug!("Remote ref not found, assuming no unpushed commits");
+                        }
+                    }
+                }
+                None => {
+                    status.has_commits = false;
+                }
+            }
+        }
+        Err(_) => {
+            status.has_commits = false;
+        }
+    }
+
+    // Check for uncommitted changes
+    match repo.is_dirty() {
+        Ok(dirty) if dirty => {
+            status.has_changes = true;
+            return Ok(status);
+        }
+        Err(e) => {
+            warn!(
+                "Failed to check if repository is dirty at {}: {}",
+                repo_path.display(),
+                e
+            );
+            return Ok(status);
+        }
+        _ => {}
+    }
+
+    // Also check for untracked files
+    let platform = match repo.status(gix::progress::Discard) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                "Failed to create status platform at {}: {}",
+                repo_path.display(),
+                e
+            );
+            return Ok(status);
+        }
+    };
+
+    match platform
+        .untracked_files(gix::status::UntrackedFiles::Files)
+        .into_index_worktree_iter(Vec::new())
+    {
+        Ok(mut iter) => {
+            for entry in iter.by_ref().flatten() {
+                if matches!(
+                    entry,
+                    gix::status::index_worktree::iter::Item::DirectoryContents { .. }
+                ) {
+                    status.has_changes = true;
+                    break;
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                "Failed to check for untracked files at {}: {}",
+                repo_path.display(),
+                e
+            );
+        }
+    }
+
+    Ok(status)
+}
+
+/// Check if a repository has any commits
+pub fn check_has_commits(repo_path: &Path) -> Result<bool> {
+    Ok(check_repo_status(repo_path)?.has_commits)
+}
+
 /// Check if a repository has unpushed commits
 pub fn check_unpushed_commits(repo_path: &Path) -> Result<bool> {
     let repo = match gix::open(repo_path) {
@@ -692,7 +840,10 @@ impl Library {
 
         // Verify the library entry exists
         if std::fs::metadata(&source).is_err() {
-            bail!("Repository not found in library for path: {}", relative_path);
+            bail!(
+                "Repository not found in library for path: {}",
+                relative_path
+            );
         }
 
         // Create parent directory if needed

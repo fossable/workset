@@ -1,4 +1,7 @@
-use super::tree::{RepoInfo, TreeNode, TreeState, build_tree, build_library_tree, flatten_trees, toggle_node_at_path, count_repos_in_trees};
+use super::tree::{
+    RepoInfo, TreeNode, TreeState, build_library_tree, build_tree, count_repos_in_trees,
+    flatten_trees, toggle_node_at_path,
+};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
@@ -81,24 +84,27 @@ impl App {
             self.filtered_library = self.library_tree.clone();
         } else {
             // Filter workspace repos by search query
-            let filtered_workspace_repos: Vec<RepoInfo> = self.workspace_repos_list
+            let filtered_workspace_repos: Vec<RepoInfo> = self
+                .workspace_repos_list
                 .iter()
                 .filter(|r| {
-                    self.matcher.fuzzy_match(&r.display_name, &self.search_query).is_some()
+                    self.matcher
+                        .fuzzy_match(&r.display_name, &self.search_query)
+                        .is_some()
                 })
                 .cloned()
                 .collect();
             self.filtered_workspace = build_tree(filtered_workspace_repos);
 
             // Filter library repos by search query
-            let filtered_library_repos: Vec<String> = self.library_repos_list
+            let filtered_library_repos: Vec<String> = self
+                .library_repos_list
                 .iter()
-                .filter(|r| {
-                    self.matcher.fuzzy_match(r, &self.search_query).is_some()
-                })
+                .filter(|r| self.matcher.fuzzy_match(r, &self.search_query).is_some())
                 .cloned()
                 .collect();
-            self.filtered_library = build_library_tree(filtered_library_repos, &self.workspace_repos_list);
+            self.filtered_library =
+                build_library_tree(filtered_library_repos, &self.workspace_repos_list);
         }
 
         // Flatten to get item counts
@@ -248,31 +254,74 @@ impl App {
 
     pub fn selected_workspace_node(&self) -> Option<TreeNode> {
         let items = self.get_flattened_workspace();
-        self.workspace_state.selected().and_then(|i| {
-            items.get(i).map(|(node, _, _, _)| node.clone())
-        })
+        self.workspace_state
+            .selected()
+            .and_then(|i| items.get(i).map(|(node, _, _, _)| node.clone()))
     }
 
     pub fn selected_library_node(&self) -> Option<TreeNode> {
         let items = self.get_flattened_library();
-        self.library_state.selected().and_then(|i| {
-            items.get(i).map(|(node, _, _, _)| node.clone())
-        })
+        self.library_state
+            .selected()
+            .and_then(|i| items.get(i).map(|(node, _, _, _)| node.clone()))
     }
 
     pub fn toggle_expand(&mut self) {
         if self.active_section == Section::Workspace {
             let items = self.get_flattened_workspace();
             if let Some(selected_idx) = self.workspace_state.selected()
-                && let Some((_, _, index_path, _)) = items.get(selected_idx).cloned() {
-                    toggle_node_at_path(&mut self.filtered_workspace, &index_path);
-                }
+                && let Some((_, _, index_path, _)) = items.get(selected_idx).cloned()
+            {
+                toggle_node_at_path(&mut self.filtered_workspace, &index_path);
+            }
         } else {
             let items = self.get_flattened_library();
             if let Some(selected_idx) = self.library_state.selected()
-                && let Some((_, _, index_path, _)) = items.get(selected_idx).cloned() {
-                    toggle_node_at_path(&mut self.filtered_library, &index_path);
-                }
+                && let Some((_, _, index_path, _)) = items.get(selected_idx).cloned()
+            {
+                toggle_node_at_path(&mut self.filtered_library, &index_path);
+            }
         }
+    }
+
+    /// Update metadata for a workspace repo by display name
+    pub fn update_workspace_metadata(
+        &mut self,
+        display_name: &str,
+        last_modified: Option<String>,
+        size: Option<String>,
+    ) {
+        for repo in &mut self.workspace_repos_list {
+            if repo.display_name == display_name {
+                if last_modified.is_some() {
+                    repo.last_modified = last_modified.clone();
+                }
+                if size.is_some() {
+                    repo.size = size.clone();
+                }
+                break;
+            }
+        }
+        // Rebuild trees to reflect changes
+        self.workspace_tree = build_tree(self.workspace_repos_list.clone());
+        self.filter_repos();
+    }
+
+    /// Update metadata for a library repo by display name
+    pub fn update_library_metadata(&mut self, display_name: &str, size: String) {
+        // Library repos are stored differently, need to update the tree directly
+        fn update_tree_size(nodes: &mut [TreeNode], display_name: &str, size: &str) {
+            for node in nodes {
+                if let Some(ref mut repo) = node.repo_info
+                    && repo.display_name == display_name
+                {
+                    repo.size = Some(size.to_string());
+                    return;
+                }
+                update_tree_size(&mut node.children, display_name, size);
+            }
+        }
+        update_tree_size(&mut self.library_tree, display_name, &size);
+        self.filter_repos();
     }
 }

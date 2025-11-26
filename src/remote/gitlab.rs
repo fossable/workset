@@ -115,7 +115,8 @@ pub fn get_suggestions() -> Vec<String> {
     if let Ok(output) = std::process::Command::new("glab")
         .args(["repo", "list", "--all", "--per-page", "100"])
         .output()
-        && output.status.success() {
+        && output.status.success()
+    {
         return String::from_utf8_lossy(&output.stdout)
             .lines()
             .filter_map(|line| {
