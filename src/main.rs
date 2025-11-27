@@ -177,22 +177,12 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
             .display()
             .to_string();
 
-        let mut status_flags = Vec::new();
-
-        // Check for uncommitted changes
-        if let Ok(true) = workset::check_uncommitted_changes(&repo) {
-            status_flags.push("modified");
-        }
-
-        // Check for unpushed commits
-        if let Ok(true) = workset::check_unpushed_commits(&repo) {
-            status_flags.push("unpushed");
-        }
-
-        let status_str = if status_flags.is_empty() {
-            "✓ clean".to_string()
-        } else {
-            format!("⚠ {}", status_flags.join(", "))
+        let status_str = match workset::check_repo_status(&repo) {
+            Ok(workset::RepoStatus::Clean) => "✓ clean".to_string(),
+            Ok(workset::RepoStatus::Dirty) => "⚠ modified".to_string(),
+            Ok(workset::RepoStatus::Unpushed) => "⚠ unpushed".to_string(),
+            Ok(workset::RepoStatus::NoCommits) => "⚠ no commits".to_string(),
+            Err(_) => "✗ error".to_string(),
         };
 
         println!("  {} - {}", repo_name, status_str);
@@ -233,17 +223,12 @@ fn show_workspace_summary(workspace: &Workspace) -> Result<()> {
         let mut unpushed = 0;
 
         for repo in &repos {
-            let has_changes = workset::check_uncommitted_changes(repo).unwrap_or(false);
-            let has_unpushed = workset::check_unpushed_commits(repo).unwrap_or(false);
-
-            if !has_changes && !has_unpushed {
-                clean += 1;
-            }
-            if has_changes {
-                modified += 1;
-            }
-            if has_unpushed {
-                unpushed += 1;
+            match workset::check_repo_status(repo) {
+                Ok(workset::RepoStatus::Clean) => clean += 1,
+                Ok(workset::RepoStatus::Dirty) => modified += 1,
+                Ok(workset::RepoStatus::Unpushed) => unpushed += 1,
+                Ok(workset::RepoStatus::NoCommits) => modified += 1,
+                Err(_) => {}
             }
         }
 

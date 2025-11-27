@@ -141,13 +141,21 @@ pub fn find_git_repositories(path: &str) -> Result<Vec<PathBuf>> {
     Ok(found)
 }
 
-/// Check if a repository has uncommitted changes using git-oxide
-/// This includes:
-/// - Modified tracked files
-/// - Deleted tracked files
-/// - Staged changes
-/// - Untracked files
-pub fn check_uncommitted_changes(repo_path: &Path) -> Result<bool> {
+/// Repository status information
+#[derive(Debug)]
+pub enum RepoStatus {
+    /// Repository is clean (has commits, no changes, no unpushed)
+    Clean,
+    /// Repository has uncommitted changes or untracked files
+    Dirty,
+    /// Repository has no commits yet
+    NoCommits,
+    /// Repository has unpushed commits (but is otherwise clean)
+    Unpushed,
+}
+
+/// Check repository status (commits, changes, unpushed) in a single pass
+pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
     let repo = match gix::open(repo_path) {
         Ok(r) => r,
         Err(e) => {
@@ -156,15 +164,20 @@ pub fn check_uncommitted_changes(repo_path: &Path) -> Result<bool> {
                 repo_path.display(),
                 e
             );
-            return Ok(false); // If we can't open it, assume it's not dirty
+            return Ok(RepoStatus::NoCommits);
         }
     };
 
-    // Use gix's built-in is_dirty() method which checks:
-    // - index vs working tree changes
-    // - working tree vs index changes
-    // - submodule status (respecting their ignore config)
-    // Note: untracked files do NOT affect is_dirty(), so we check separately
+    // Check if repo has commits
+    let head_ref = match repo.head() {
+        Ok(head) => match head.try_into_referent() {
+            Some(head_ref) => head_ref,
+            None => return Ok(RepoStatus::NoCommits),
+        },
+        Err(_) => return Ok(RepoStatus::NoCommits),
+    };
+
+    // Check for uncommitted changes first (using is_dirty)
     let is_dirty = match repo.is_dirty() {
         Ok(dirty) => dirty,
         Err(e) => {
@@ -173,16 +186,12 @@ pub fn check_uncommitted_changes(repo_path: &Path) -> Result<bool> {
                 repo_path.display(),
                 e
             );
-            return Ok(false);
+            false
         }
     };
 
     if is_dirty {
-        debug!(
-            "Repository has uncommitted changes: {}",
-            repo_path.display()
-        );
-        return Ok(true);
+        return Ok(RepoStatus::Dirty);
     }
 
     // Also check for untracked files
@@ -194,240 +203,76 @@ pub fn check_uncommitted_changes(repo_path: &Path) -> Result<bool> {
                 repo_path.display(),
                 e
             );
-            return Ok(false);
+            return Ok(RepoStatus::Clean);
         }
     };
 
-    match platform
+    let has_untracked = match platform
         .untracked_files(gix::status::UntrackedFiles::Files)
         .into_index_worktree_iter(Vec::new())
     {
-        Ok(mut iter) => {
-            // Check if there are any untracked files
-            for entry in iter.by_ref().flatten() {
-                // Check if this is an untracked file
-                if matches!(
-                    entry,
-                    gix::status::index_worktree::iter::Item::DirectoryContents { .. }
-                ) {
-                    debug!("Repository has untracked files: {}", repo_path.display());
-                    return Ok(true);
-                }
-            }
-        }
+        Ok(mut iter) => iter.by_ref().flatten().next().is_some(),
         Err(e) => {
             warn!(
                 "Failed to check for untracked files at {}: {}",
                 repo_path.display(),
                 e
             );
-        }
-    }
-
-    Ok(false)
-}
-
-/// Repository status information
-#[derive(Debug, Default)]
-pub struct RepoStatus {
-    pub has_changes: bool,
-    pub has_unpushed: bool,
-    pub has_commits: bool,
-}
-
-/// Check repository status (commits, changes, unpushed) in a single pass
-pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
-    let mut status = RepoStatus::default();
-
-    let repo = match gix::open(repo_path) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(
-                "Failed to open repository at {}: {}",
-                repo_path.display(),
-                e
-            );
-            return Ok(status);
+            false
         }
     };
 
-    // Check if repo has commits
-    match repo.head() {
-        Ok(head) => {
-            match head.try_into_referent() {
-                Some(head_ref) => {
-                    status.has_commits = true;
-
-                    // Check for unpushed commits
-                    let local_branch = head_ref.name();
-                    let remote_ref_name = match repo
-                        .branch_remote_ref_name(local_branch, gix::remote::Direction::Fetch)
-                    {
-                        Some(Ok(name)) => name,
-                        Some(Err(e)) => {
-                            debug!("Failed to get remote ref: {}", e);
-                            return Ok(status); // Can't check unpushed, but we have commits
-                        }
-                        None => {
-                            debug!("No upstream branch configured");
-                            return Ok(status); // No upstream, can't check unpushed
-                        }
-                    };
-
-                    // Try to find the remote ref
-                    match repo.find_reference(remote_ref_name.as_ref()) {
-                        Ok(remote_ref) => {
-                            let local_commit = match head_ref.id().object() {
-                                Ok(obj) => obj.id,
-                                Err(e) => {
-                                    warn!("Failed to get local commit: {}", e);
-                                    return Ok(status);
-                                }
-                            };
-
-                            let remote_commit = match remote_ref.id().object() {
-                                Ok(obj) => obj.id,
-                                Err(e) => {
-                                    warn!("Failed to get remote commit: {}", e);
-                                    return Ok(status);
-                                }
-                            };
-
-                            // If commits are different, we might have unpushed commits
-                            if local_commit != remote_commit {
-                                status.has_unpushed = true;
-                            }
-                        }
-                        Err(_) => {
-                            debug!("Remote ref not found, assuming no unpushed commits");
-                        }
-                    }
-                }
-                None => {
-                    status.has_commits = false;
-                }
-            }
-        }
-        Err(_) => {
-            status.has_commits = false;
-        }
+    if has_untracked {
+        return Ok(RepoStatus::Dirty);
     }
 
-    // Check for uncommitted changes
-    match repo.is_dirty() {
-        Ok(dirty) if dirty => {
-            status.has_changes = true;
-            return Ok(status);
-        }
-        Err(e) => {
-            warn!(
-                "Failed to check if repository is dirty at {}: {}",
-                repo_path.display(),
-                e
-            );
-            return Ok(status);
-        }
-        _ => {}
-    }
-
-    // Also check for untracked files
-    let platform = match repo.status(gix::progress::Discard) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(
-                "Failed to create status platform at {}: {}",
-                repo_path.display(),
-                e
-            );
-            return Ok(status);
-        }
-    };
-
-    match platform
-        .untracked_files(gix::status::UntrackedFiles::Files)
-        .into_index_worktree_iter(Vec::new())
-    {
-        Ok(mut iter) => {
-            for entry in iter.by_ref().flatten() {
-                if matches!(
-                    entry,
-                    gix::status::index_worktree::iter::Item::DirectoryContents { .. }
-                ) {
-                    status.has_changes = true;
-                    break;
-                }
-            }
-        }
-        Err(e) => {
-            warn!(
-                "Failed to check for untracked files at {}: {}",
-                repo_path.display(),
-                e
-            );
-        }
-    }
-
-    Ok(status)
-}
-
-/// Check if a repository has any commits
-pub fn check_has_commits(repo_path: &Path) -> Result<bool> {
-    Ok(check_repo_status(repo_path)?.has_commits)
-}
-
-/// Check if a repository has unpushed commits
-pub fn check_unpushed_commits(repo_path: &Path) -> Result<bool> {
-    let repo = match gix::open(repo_path) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(
-                "Failed to open repository at {}: {}",
-                repo_path.display(),
-                e
-            );
-            return Ok(false);
-        }
-    };
-
-    // Get the current branch
-    let head = repo.head()?;
-    let head_ref = match head.try_into_referent() {
-        Some(r) => r,
-        None => {
-            debug!("HEAD is detached, no tracking branch");
-            return Ok(false); // Detached HEAD, no upstream to compare
-        }
-    };
-
-    // Get the upstream branch if it exists
+    // Check for unpushed commits
     let local_branch = head_ref.name();
     let remote_ref_name =
         match repo.branch_remote_ref_name(local_branch, gix::remote::Direction::Fetch) {
             Some(Ok(name)) => name,
             Some(Err(e)) => {
-                debug!("Error getting remote ref name: {}", e);
-                return Ok(false);
+                debug!("Failed to get remote ref: {}", e);
+                return Ok(RepoStatus::Clean);
             }
             None => {
                 debug!("No upstream branch configured");
-                return Ok(false); // No upstream configured
+                return Ok(RepoStatus::Clean);
             }
         };
 
-    // Try to find the remote reference
-    let remote_ref = match repo.find_reference(remote_ref_name.as_ref()) {
-        Ok(r) => r,
+    // Try to find the remote ref
+    let has_unpushed = match repo.find_reference(remote_ref_name.as_ref()) {
+        Ok(remote_ref) => {
+            let local_commit = match head_ref.id().object() {
+                Ok(obj) => obj.id,
+                Err(e) => {
+                    warn!("Failed to get local commit: {}", e);
+                    return Ok(RepoStatus::Clean);
+                }
+            };
+
+            let remote_commit = match remote_ref.id().object() {
+                Ok(obj) => obj.id,
+                Err(e) => {
+                    warn!("Failed to get remote commit: {}", e);
+                    return Ok(RepoStatus::Clean);
+                }
+            };
+
+            local_commit != remote_commit
+        }
         Err(_) => {
-            debug!("Remote reference not found: {:?}", remote_ref_name);
-            return Ok(false); // Remote ref doesn't exist (never pushed)
+            debug!("Remote ref not found, assuming no unpushed commits");
+            false
         }
     };
 
-    // Compare local and remote commit IDs
-    let local_commit = head_ref.id();
-    let remote_commit = remote_ref.id();
-
-    Ok(local_commit != remote_commit)
+    if has_unpushed {
+        Ok(RepoStatus::Unpushed)
+    } else {
+        Ok(RepoStatus::Clean)
+    }
 }
 
 /// A `Workspace` is filesystem directory containing git repositories checked out
@@ -559,11 +404,10 @@ impl Workspace {
             info!("✓ Repository already in workspace: {}", repo.display());
 
             // Check if there are any uncommitted changes or unpushed commits
-            if check_uncommitted_changes(repo)? {
-                info!("  ⚠ Has uncommitted changes");
-            }
-            if check_unpushed_commits(repo)? {
-                info!("  ⚠ Has unpushed commits");
+            match check_repo_status(repo)? {
+                RepoStatus::Dirty => info!("  ⚠ Has uncommitted changes"),
+                RepoStatus::Unpushed => info!("  ⚠ Has unpushed commits"),
+                _ => {}
             }
 
             return Ok(local_repos[0].clone());
@@ -630,23 +474,24 @@ impl Workspace {
         for repo in repos {
             // Check for uncommitted changes unless --force is given
             if !force {
-                if check_uncommitted_changes(&repo)? {
-                    warn!(
-                        "⚠ Refusing to drop repository with uncommitted changes: {}",
-                        repo.display()
-                    );
-                    warn!("  Use --force to drop anyway");
-                    continue;
-                }
-
-                // Check for unpushed commits
-                if check_unpushed_commits(&repo)? {
-                    warn!(
-                        "⚠ Refusing to drop repository with unpushed commits: {}",
-                        repo.display()
-                    );
-                    warn!("  Use --force to drop anyway");
-                    continue;
+                match check_repo_status(&repo)? {
+                    RepoStatus::Dirty => {
+                        warn!(
+                            "⚠ Refusing to drop repository with uncommitted changes: {}",
+                            repo.display()
+                        );
+                        warn!("  Use --force to drop anyway");
+                        continue;
+                    }
+                    RepoStatus::Unpushed => {
+                        warn!(
+                            "⚠ Refusing to drop repository with unpushed commits: {}",
+                            repo.display()
+                        );
+                        warn!("  Use --force to drop anyway");
+                        continue;
+                    }
+                    _ => {}
                 }
             }
 
@@ -696,23 +541,24 @@ impl Workspace {
         for repo in repos {
             // Check for uncommitted changes unless --force is given
             if !force {
-                if check_uncommitted_changes(&repo)? {
-                    warn!(
-                        "⚠ Skipping repository with uncommitted changes: {}",
-                        repo.display()
-                    );
-                    skipped += 1;
-                    continue;
-                }
-
-                // Check for unpushed commits
-                if check_unpushed_commits(&repo)? {
-                    warn!(
-                        "⚠ Skipping repository with unpushed commits: {}",
-                        repo.display()
-                    );
-                    skipped += 1;
-                    continue;
+                match check_repo_status(&repo)? {
+                    RepoStatus::Dirty => {
+                        warn!(
+                            "⚠ Skipping repository with uncommitted changes: {}",
+                            repo.display()
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                    RepoStatus::Unpushed => {
+                        warn!(
+                            "⚠ Skipping repository with unpushed commits: {}",
+                            repo.display()
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                    _ => {}
                 }
             }
 

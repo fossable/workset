@@ -121,9 +121,9 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                     .to_string();
 
                 // Check repo status in a single pass for performance
-                let status = check_repo_status(&path).unwrap_or_default();
+                let status = check_repo_status(&path).unwrap_or(crate::RepoStatus::NoCommits);
                 // A repo is only clean if it has commits, no changes, and no unpushed commits
-                let is_clean = status.has_commits && !status.has_changes && !status.has_unpushed;
+                let is_clean = matches!(status, crate::RepoStatus::Clean);
 
                 // Get modification time
                 let modification_time = get_repo_modification_time(&path, is_clean).ok();

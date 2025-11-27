@@ -2,22 +2,6 @@ use anyhow::Result;
 use std::path::Path;
 use std::time::SystemTime;
 
-/// Format a SystemTime as a debug string (Unix timestamp)
-fn format_timestamp_debug(time: SystemTime) -> String {
-    use std::time::UNIX_EPOCH;
-
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => {
-            let secs = duration.as_secs();
-            format!(
-                "{} ({})",
-                secs,
-                chrono::DateTime::<chrono::Local>::from(time).format("%Y-%m-%d %H:%M:%S")
-            )
-        }
-        Err(_) => "invalid".to_string(),
-    }
-}
 
 /// Format a SystemTime as a human-readable "time ago" string
 pub fn format_time_ago(time: SystemTime) -> String {
@@ -156,7 +140,6 @@ fn get_dirty_files_modification_time(repo_path: &Path) -> Result<SystemTime> {
 
     let mut latest_time = SystemTime::UNIX_EPOCH;
 
-    let mut file_count = 0;
     for line in String::from_utf8(output.stdout)?.lines() {
         if line.len() < 4 {
             continue;
@@ -169,7 +152,6 @@ fn get_dirty_files_modification_time(repo_path: &Path) -> Result<SystemTime> {
         if let Ok(metadata) = std::fs::metadata(&file_path)
             && let Ok(modified) = metadata.modified()
         {
-            file_count += 1;
             if modified > latest_time {
                 latest_time = modified;
             }
