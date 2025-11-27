@@ -137,6 +137,7 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                     is_clean,
                     modification_time,
                     size_bytes,
+                    operation_status: tree::RepoOperationStatus::None,
                 }
             })
             .collect();
@@ -160,6 +161,7 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                         is_clean: true, // Library repos are always clean
                         modification_time,
                         size_bytes,
+                        operation_status: tree::RepoOperationStatus::None,
                     }
                 })
                 .collect()
@@ -177,22 +179,34 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
         // Create app
         let mut app = App::new(workspace_repos, library_repos);
 
-        // Run app
-        let action = run_app(&mut terminal, &mut app, log_capture.clone())?;
+        // Inner loop to handle actions without tearing down terminal
+        loop {
+            // Run app
+            let action = run_app(&mut terminal, &mut app, log_capture.clone())?;
 
-        // Restore terminal
-        disable_raw_mode()?;
-        execute!(
-            terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        )?;
-        terminal.show_cursor()?;
-
-        // Handle the action
-        match action {
-            Action::None => break,
+            // Handle the action
+            match action {
+            Action::None => {
+                // Restore terminal before exiting
+                disable_raw_mode()?;
+                execute!(
+                    terminal.backend_mut(),
+                    LeaveAlternateScreen,
+                    DisableMouseCapture
+                )?;
+                terminal.show_cursor()?;
+                return Ok(()); // Exit completely
+            }
             Action::OpenShell(path) => {
+                // Restore terminal before opening shell
+                disable_raw_mode()?;
+                execute!(
+                    terminal.backend_mut(),
+                    LeaveAlternateScreen,
+                    DisableMouseCapture
+                )?;
+                terminal.show_cursor()?;
+
                 log_capture.set_message(format!("Opening shell at: {}", path.display()));
 
                 // Try to detect the actual parent shell
@@ -206,47 +220,49 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                     .current_dir(&path)
                     .status()?;
 
-                // After shell exits, loop back to show TUI again
-                continue;
+                // After shell exits, break inner loop to restart outer loop (recreate terminal)
+                break;
             }
             Action::DropToLibrary(repo_paths) => {
                 use crate::RepoPattern;
 
-                let count = repo_paths.len();
-                log_capture.set_message(format!("📦 Dropping {} repo(s) to library...", count));
-                // Force a redraw to show the message immediately
-                app.last_log_message = log_capture.get_message();
-                terminal.draw(|f| ui(f, &mut app))?;
-
                 let mut success_count = 0;
                 let mut error_count = 0;
 
-                for repo_path in repo_paths {
+                for repo_path in &repo_paths {
+                    // Mark as dropping
+                    app.update_repo_status(repo_path, tree::RepoOperationStatus::Dropping);
+                    terminal.draw(|f| ui(f, &mut app))?;
+
+                    // Small delay so user can see the status change
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+
                     let pattern: RepoPattern = match repo_path.parse() {
                         Ok(p) => p,
                         Err(e) => {
-                            log_capture.set_message(format!(
-                                "✗ Failed to parse pattern {}: {}",
-                                repo_path, e
-                            ));
+                            app.update_repo_status(repo_path, tree::RepoOperationStatus::Failed(format!("Parse error: {}", e)));
+                            terminal.draw(|f| ui(f, &mut app))?;
                             error_count += 1;
                             continue;
                         }
                     };
 
                     match workspace.drop(workspace.library.as_ref(), &pattern, false, false) {
-                        Ok(_) => success_count += 1,
+                        Ok(_) => {
+                            app.update_repo_status(repo_path, tree::RepoOperationStatus::Success);
+                            success_count += 1;
+                        }
                         Err(e) => {
-                            log_capture
-                                .set_message(format!("✗ Failed to drop {}: {}", repo_path, e));
+                            app.update_repo_status(repo_path, tree::RepoOperationStatus::Failed(e.to_string()));
                             error_count += 1;
                         }
                     }
+                    terminal.draw(|f| ui(f, &mut app))?;
                 }
 
+                // Set final message
                 if error_count == 0 {
-                    log_capture
-                        .set_message(format!("✓ Dropped {} repo(s) to library", success_count));
+                    log_capture.set_message(format!("✓ Dropped {} repo(s) to library", success_count));
                 } else {
                     log_capture.set_message(format!(
                         "⚠ Dropped {} repo(s), {} failed",
@@ -254,39 +270,98 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                     ));
                 }
 
-                // Loop back to refresh TUI
+                // Wait a moment for user to see the result
+                std::thread::sleep(std::time::Duration::from_millis(500));
+
+                // Reload repository data and rebuild the app state
+                let workspace_repos: Vec<RepoInfo> = find_git_repositories(&workspace.path)?
+                    .into_iter()
+                    .map(|path| {
+                        let display_name = path
+                            .strip_prefix(&workspace.path)
+                            .unwrap_or(&path)
+                            .display()
+                            .to_string()
+                            .trim_start_matches('/')
+                            .to_string();
+                        let status = check_repo_status(&path).unwrap_or(crate::RepoStatus::NoCommits);
+                        let is_clean = matches!(status, crate::RepoStatus::Clean);
+                        let modification_time = get_repo_modification_time(&path, is_clean).ok();
+                        RepoInfo {
+                            path,
+                            display_name,
+                            is_clean,
+                            modification_time,
+                            size_bytes: None,
+                            operation_status: tree::RepoOperationStatus::None,
+                        }
+                    })
+                    .collect();
+
+                let library_repos: Vec<RepoInfo> = if let Some(library) = &workspace.library {
+                    library
+                        .list()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|repo_path| {
+                            let full_path = PathBuf::from(&library.path).join(&repo_path);
+                            let modification_time = get_repo_modification_time(&full_path, true).ok();
+                            let size_bytes = get_repo_size(&full_path).ok();
+                            RepoInfo {
+                                path: full_path,
+                                display_name: repo_path,
+                                is_clean: true,
+                                modification_time,
+                                size_bytes,
+                                operation_status: tree::RepoOperationStatus::None,
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                // Rebuild app with fresh data
+                app = App::new(workspace_repos, library_repos);
+                app.last_log_message = log_capture.get_message();
+
+                // Continue inner loop without tearing down terminal
                 continue;
             }
             Action::RestoreFromLibrary(repo_paths) => {
-                let count = repo_paths.len();
-                log_capture.set_message(format!("📦 Restoring {} repo(s) from library...", count));
-                // Force a redraw to show the message immediately
-                app.last_log_message = log_capture.get_message();
-                terminal.draw(|f| ui(f, &mut app))?;
-
                 let mut success_count = 0;
                 let mut error_count = 0;
 
-                for repo_path in repo_paths {
+                for repo_path in &repo_paths {
+                    // Mark as restoring
+                    app.update_repo_status(repo_path, tree::RepoOperationStatus::Restoring);
+                    terminal.draw(|f| ui(f, &mut app))?;
+
+                    // Small delay so user can see the status change
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+
                     let result = if let Some(library) = &workspace.library {
-                        library.restore_to_workspace(&workspace.path, &repo_path)
+                        library.restore_to_workspace(&workspace.path, repo_path)
                     } else {
                         Ok(())
                     };
 
                     match result {
-                        Ok(_) => success_count += 1,
+                        Ok(_) => {
+                            app.update_repo_status(repo_path, tree::RepoOperationStatus::Success);
+                            success_count += 1;
+                        }
                         Err(e) => {
-                            log_capture
-                                .set_message(format!("✗ Failed to restore {}: {}", repo_path, e));
+                            app.update_repo_status(repo_path, tree::RepoOperationStatus::Failed(e.to_string()));
                             error_count += 1;
                         }
                     }
+                    terminal.draw(|f| ui(f, &mut app))?;
                 }
 
+                // Set final message
                 if error_count == 0 {
-                    log_capture
-                        .set_message(format!("✓ Restored {} repo(s) from library", success_count));
+                    log_capture.set_message(format!("✓ Restored {} repo(s) from library", success_count));
                 } else {
                     log_capture.set_message(format!(
                         "⚠ Restored {} repo(s), {} failed",
@@ -294,7 +369,62 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                     ));
                 }
 
-                // Loop back to refresh TUI
+                // Wait a moment for user to see the result
+                std::thread::sleep(std::time::Duration::from_millis(500));
+
+                // Reload repository data and rebuild the app state
+                let workspace_repos: Vec<RepoInfo> = find_git_repositories(&workspace.path)?
+                    .into_iter()
+                    .map(|path| {
+                        let display_name = path
+                            .strip_prefix(&workspace.path)
+                            .unwrap_or(&path)
+                            .display()
+                            .to_string()
+                            .trim_start_matches('/')
+                            .to_string();
+                        let status = check_repo_status(&path).unwrap_or(crate::RepoStatus::NoCommits);
+                        let is_clean = matches!(status, crate::RepoStatus::Clean);
+                        let modification_time = get_repo_modification_time(&path, is_clean).ok();
+                        RepoInfo {
+                            path,
+                            display_name,
+                            is_clean,
+                            modification_time,
+                            size_bytes: None,
+                            operation_status: tree::RepoOperationStatus::None,
+                        }
+                    })
+                    .collect();
+
+                let library_repos: Vec<RepoInfo> = if let Some(library) = &workspace.library {
+                    library
+                        .list()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|repo_path| {
+                            let full_path = PathBuf::from(&library.path).join(&repo_path);
+                            let modification_time = get_repo_modification_time(&full_path, true).ok();
+                            let size_bytes = get_repo_size(&full_path).ok();
+                            RepoInfo {
+                                path: full_path,
+                                display_name: repo_path,
+                                is_clean: true,
+                                modification_time,
+                                size_bytes,
+                                operation_status: tree::RepoOperationStatus::None,
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                // Rebuild app with fresh data
+                app = App::new(workspace_repos, library_repos);
+                app.last_log_message = log_capture.get_message();
+
+                // Continue inner loop without tearing down terminal
                 continue;
             }
             Action::AddRepo(repo_pattern) => {
@@ -320,10 +450,9 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                 // Loop back to refresh TUI
                 continue;
             }
-        }
-    }
-
-    Ok(())
+            } // End of action match
+        } // End of inner loop
+    } // End of outer loop
 }
 
 fn run_app<B: ratatui::backend::Backend>(
@@ -775,19 +904,33 @@ fn ui(f: &mut Frame, app: &mut App) {
                 text_width += span.content.chars().count();
             }
 
-            // Add modification time for workspace repos (right-aligned if available)
-            if let Some(ref repo) = node.repo_info
-                && let Some(mod_time) = repo.modification_time
-            {
-                let time_str = format_time_ago(mod_time);
-                let metadata_width = time_str.chars().count();
-                // Calculate padding needed to right-align (ensure at least 1 space)
-                let padding_needed = workspace_width
-                    .saturating_sub(text_width)
-                    .saturating_sub(metadata_width)
-                    .max(1);
-                spans.push(Span::raw(" ".repeat(padding_needed)));
-                spans.push(Span::styled(time_str, Style::default().fg(Color::DarkGray)));
+            // Add operation status or modification time for workspace repos
+            if let Some(ref repo) = node.repo_info {
+                let (status_text, status_color) = match &repo.operation_status {
+                    tree::RepoOperationStatus::None => {
+                        // Show modification time if available
+                        if let Some(mod_time) = repo.modification_time {
+                            (format_time_ago(mod_time), Color::DarkGray)
+                        } else {
+                            (String::new(), Color::DarkGray)
+                        }
+                    }
+                    tree::RepoOperationStatus::Dropping => ("dropping...".to_string(), Color::Yellow),
+                    tree::RepoOperationStatus::Restoring => ("restoring...".to_string(), Color::Cyan),
+                    tree::RepoOperationStatus::Success => ("done".to_string(), Color::Green),
+                    tree::RepoOperationStatus::Failed(err) => (format!("failed: {}", err), Color::Red),
+                };
+
+                if !status_text.is_empty() {
+                    let metadata_width = status_text.chars().count();
+                    // Calculate padding needed to right-align (ensure at least 1 space)
+                    let padding_needed = workspace_width
+                        .saturating_sub(text_width)
+                        .saturating_sub(metadata_width)
+                        .max(1);
+                    spans.push(Span::raw(" ".repeat(padding_needed)));
+                    spans.push(Span::styled(status_text, Style::default().fg(status_color)));
+                }
             }
 
             ListItem::new(Line::from(spans))
@@ -928,19 +1071,33 @@ fn ui(f: &mut Frame, app: &mut App) {
                 text_width += span.content.chars().count();
             }
 
-            // Add size for library repos (right-aligned if available)
-            if let Some(ref repo) = node.repo_info
-                && let Some(size_bytes) = repo.size_bytes
-            {
-                let size_str = format_size(size_bytes);
-                let metadata_width = size_str.chars().count();
-                // Calculate padding needed to right-align (ensure at least 1 space)
-                let padding_needed = library_width
-                    .saturating_sub(text_width)
-                    .saturating_sub(metadata_width)
-                    .max(1);
-                spans.push(Span::raw(" ".repeat(padding_needed)));
-                spans.push(Span::styled(size_str, Style::default().fg(Color::DarkGray)));
+            // Add operation status or size for library repos
+            if let Some(ref repo) = node.repo_info {
+                let (status_text, status_color) = match &repo.operation_status {
+                    tree::RepoOperationStatus::None => {
+                        // Show size if available
+                        if let Some(size_bytes) = repo.size_bytes {
+                            (format_size(size_bytes), Color::DarkGray)
+                        } else {
+                            (String::new(), Color::DarkGray)
+                        }
+                    }
+                    tree::RepoOperationStatus::Dropping => ("dropping...".to_string(), Color::Yellow),
+                    tree::RepoOperationStatus::Restoring => ("restoring...".to_string(), Color::Cyan),
+                    tree::RepoOperationStatus::Success => ("done".to_string(), Color::Green),
+                    tree::RepoOperationStatus::Failed(err) => (format!("failed: {}", err), Color::Red),
+                };
+
+                if !status_text.is_empty() {
+                    let metadata_width = status_text.chars().count();
+                    // Calculate padding needed to right-align (ensure at least 1 space)
+                    let padding_needed = library_width
+                        .saturating_sub(text_width)
+                        .saturating_sub(metadata_width)
+                        .max(1);
+                    spans.push(Span::raw(" ".repeat(padding_needed)));
+                    spans.push(Span::styled(status_text, Style::default().fg(status_color)));
+                }
             }
 
             ListItem::new(Line::from(spans))
@@ -1087,3 +1244,4 @@ fn render_add_repo_dialog(f: &mut Frame, app: &App) {
     state.select(app.add_repo_state.selected());
     f.render_stateful_widget(suggestions, chunks[1], &mut state);
 }
+

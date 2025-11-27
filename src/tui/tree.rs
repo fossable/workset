@@ -19,6 +19,15 @@ impl TreeState {
     }
 }
 
+#[derive(Clone, PartialEq)]
+pub enum RepoOperationStatus {
+    None,
+    Dropping,
+    Restoring,
+    Success,
+    Failed(String),
+}
+
 #[derive(Clone)]
 pub struct RepoInfo {
     pub path: PathBuf,
@@ -28,6 +37,8 @@ pub struct RepoInfo {
     pub modification_time: Option<std::time::SystemTime>,
     /// Size on disk in bytes
     pub size_bytes: Option<u64>,
+    /// Current operation status
+    pub operation_status: RepoOperationStatus,
 }
 
 #[derive(Clone)]
