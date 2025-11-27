@@ -76,3 +76,18 @@ Don't let Github be the only place you store your repos!
 **Workset** makes it easy to keep local copies of all of your repos without
 having to sift through them to find the ones you're currently working on.
 Mirroring repos to other hosting providers is also supported.
+
+## Installation
+
+<details>
+<summary>Crates.io</summary>
+
+![Crates.io Total Downloads](https://img.shields.io/crates/d/workset)
+
+#### Install from crates.io
+
+```sh
+cargo install workset
+```
+
+</details>
