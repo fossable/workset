@@ -21,7 +21,7 @@ pub struct App {
     workspace_tree: Vec<TreeNode>,
     library_tree: Vec<TreeNode>,
     workspace_repos_list: Vec<RepoInfo>,
-    library_repos_list: Vec<String>,
+    library_repos_list: Vec<RepoInfo>,
     pub filtered_workspace: Vec<TreeNode>,
     pub filtered_library: Vec<TreeNode>,
     pub workspace_state: TreeState,
@@ -37,7 +37,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(workspace_repos: Vec<RepoInfo>, library_repos: Vec<String>) -> Self {
+    pub fn new(workspace_repos: Vec<RepoInfo>, library_repos: Vec<RepoInfo>) -> Self {
         let workspace_tree = build_tree(workspace_repos.clone());
         let library_tree = build_library_tree(library_repos.clone(), &workspace_repos);
 
@@ -97,10 +97,14 @@ impl App {
             self.filtered_workspace = build_tree(filtered_workspace_repos);
 
             // Filter library repos by search query
-            let filtered_library_repos: Vec<String> = self
+            let filtered_library_repos: Vec<RepoInfo> = self
                 .library_repos_list
                 .iter()
-                .filter(|r| self.matcher.fuzzy_match(r, &self.search_query).is_some())
+                .filter(|r| {
+                    self.matcher
+                        .fuzzy_match(&r.display_name, &self.search_query)
+                        .is_some()
+                })
                 .cloned()
                 .collect();
             self.filtered_library =
@@ -284,44 +288,4 @@ impl App {
         }
     }
 
-    /// Update metadata for a workspace repo by display name
-    pub fn update_workspace_metadata(
-        &mut self,
-        display_name: &str,
-        last_modified: Option<String>,
-        size: Option<String>,
-    ) {
-        for repo in &mut self.workspace_repos_list {
-            if repo.display_name == display_name {
-                if last_modified.is_some() {
-                    repo.last_modified = last_modified.clone();
-                }
-                if size.is_some() {
-                    repo.size = size.clone();
-                }
-                break;
-            }
-        }
-        // Rebuild trees to reflect changes
-        self.workspace_tree = build_tree(self.workspace_repos_list.clone());
-        self.filter_repos();
-    }
-
-    /// Update metadata for a library repo by display name
-    pub fn update_library_metadata(&mut self, display_name: &str, size: String) {
-        // Library repos are stored differently, need to update the tree directly
-        fn update_tree_size(nodes: &mut [TreeNode], display_name: &str, size: &str) {
-            for node in nodes {
-                if let Some(ref mut repo) = node.repo_info
-                    && repo.display_name == display_name
-                {
-                    repo.size = Some(size.to_string());
-                    return;
-                }
-                update_tree_size(&mut node.children, display_name, size);
-            }
-        }
-        update_tree_size(&mut self.library_tree, display_name, &size);
-        self.filter_repos();
-    }
 }

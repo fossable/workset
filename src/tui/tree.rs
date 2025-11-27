@@ -24,10 +24,10 @@ pub struct RepoInfo {
     pub path: PathBuf,
     pub display_name: String,
     pub is_clean: bool,
-    /// Last modification time as human-readable string (e.g., "5 minutes ago")
-    pub last_modified: Option<String>,
-    /// Size on disk in human-readable format (e.g., "1.2 GB")
-    pub size: Option<String>,
+    /// Modification time (for sorting and display)
+    pub modification_time: Option<std::time::SystemTime>,
+    /// Size on disk in bytes
+    pub size_bytes: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -130,7 +130,17 @@ impl TreeNode {
 }
 
 /// Build a tree structure from a flat list of repos
-pub fn build_tree(repos: Vec<RepoInfo>) -> Vec<TreeNode> {
+pub fn build_tree(mut repos: Vec<RepoInfo>) -> Vec<TreeNode> {
+    // Sort repos by modification time (most recent first)
+    repos.sort_by(|a, b| {
+        match (a.modification_time, b.modification_time) {
+            (Some(a_time), Some(b_time)) => b_time.cmp(&a_time), // Most recent first
+            (Some(_), None) => std::cmp::Ordering::Less,          // Items with time come first
+            (None, Some(_)) => std::cmp::Ordering::Greater,       // Items without time come last
+            (None, None) => a.display_name.cmp(&b.display_name),  // Fallback to name
+        }
+    });
+
     let mut root_nodes: Vec<TreeNode> = Vec::new();
 
     for repo in repos {
@@ -173,7 +183,7 @@ pub fn build_tree(repos: Vec<RepoInfo>) -> Vec<TreeNode> {
 
 /// Build library tree, excluding repos that exist in workspace
 pub fn build_library_tree(
-    library_repos: Vec<String>,
+    library_repos: Vec<RepoInfo>,
     workspace_repos: &[RepoInfo],
 ) -> Vec<TreeNode> {
     let workspace_paths: std::collections::HashSet<_> = workspace_repos
@@ -183,14 +193,7 @@ pub fn build_library_tree(
 
     let filtered_repos: Vec<RepoInfo> = library_repos
         .into_iter()
-        .filter(|repo_path| !workspace_paths.contains(repo_path.as_str()))
-        .map(|path| RepoInfo {
-            path: PathBuf::from(&path),
-            display_name: path.clone(),
-            is_clean: true,      // Library repos are always considered clean
-            last_modified: None, // Will be computed asynchronously
-            size: None,          // Will be computed asynchronously
-        })
+        .filter(|repo| !workspace_paths.contains(repo.display_name.as_str()))
         .collect();
 
     build_tree(filtered_repos)

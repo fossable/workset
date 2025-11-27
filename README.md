@@ -1,5 +1,5 @@
 <p align="center">
-	<img src="https://raw.githubusercontent.com/fossable/workset/master/.github/images/workset-256.png" />
+	<img src="https://raw.githubusercontent.com/fossable/fossable/master/emblems/workset.svg" style="width:90%; height:auto;"/>
 </p>
 
 ![License](https://img.shields.io/github/license/fossable/workset)
@@ -9,38 +9,17 @@
 
 <hr>
 
-**workset** is yet another tool for managing git repos locally.
+**workset** is yet another tool for managing your local git repos.
 
-### Worksets
+| Glossary        |                                                                                                                                                                                     |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Workspace**   | Local directory where you clone Git repositories. Initialized with `workset init`.                                                                                                  |
+| **Library**     | Local directory (default: `~/.workset`) where **workset** keeps your repos when they're not in your workspace.                                                                      |
+| **Working Set** | Set of repos in your workspace at any given time.                                                                                                                                   |
+| **Drop**        | Move a repo from your workspace to the library. The repo disappears from your workspace, but remains in the library. Only "clean" repos without uncommitted changes can be dropped. |
+| **Restore**     | Bringing a repos from the library back into your workspace.                                                                                                                         |
 
-Simply defined, a _working set_ is all of the repositories you need to work on
-at any given time. Even more simply, your _workspace_ is the local directory
-where you keep your Git repositories.
-
-For many developers, our Git workspaces tend to become "libraries" that contains
-all the projects we've ever worked on, spanning multiple Git providers. A quick
-survey revealed that I had 46 personal repos in my workspace and 192 for my job.
-With all of that junk piled up, it becomes hard to remember what repos have
-outstanding changes that still need to be completed.
-
-The principle behind **workset** is that your workspace should only consist of
-your _working set_. This reduces unnecessary noise as repositories accumulate in
-your workspace over time and improves indexing performance of your development
-tools.
-
-Adhering to this principle involves frequently cloning and deleting repositories
-from your workspace, so `workset` makes these mechanics _fast_ and _easy_. When
-repositories are dropped from your workspace, they are just saved locally in a
-_library_ so restoring them later can be done in an instant.
-
-### Github can kill you
-
-Maybe not actually, but they can delete your account along with your repos any
-day of the week. It has happened before. Don't let them have full control of
-your repos! **workset** keeps full mirrors of all of your repos locally to keep
-them safe.
-
-### Quickstart
+## Quickstart
 
 All `workset` commands run in reference to the current directory.
 
@@ -48,13 +27,13 @@ All `workset` commands run in reference to the current directory.
 # Initialize a new workspace in the current directory
 ❯ workset init
 
-# Add a repository to your working set
+# Add (clone) a repository to your workspace
 ❯ workset github.com/jqlang/jq
 
 # The repository's local path always reflects the remote path
 ❯ cd ./github.com/jqlang/jq
 
-# Drop the repo from the working set (it remains in the library)
+# Drop the repo from the working set (it remains in the library: ~/.workset)
 ❯ cd ..
 ❯ workset drop ./jq
 
@@ -65,35 +44,35 @@ All `workset` commands run in reference to the current directory.
 # If you don't want a repo to remain in the library, use --delete
 ❯ workset drop --delete ./delete_this_repo
 
-# When you need to work on a repository again, it's restored from the local library.
-# Any upstream changes are also fetched.
+# When you need to work on a repository again, it's restored from the local library
 ❯ workset jq
 ```
 
-#### Autocomplete
-
 The shell autocomplete is smart enough to look at your CWD and suggest repos
 that you might want to restore into your working set. Repos that were dropped
-most recently are sorted first.
+most recently are prioritized.
 
-```sh
-# Library contains: jqlang/jq
+## Keep your working set small
 
-❯ workset jql[TAB]
-jqlang/jq
-```
+The point of dropping repos out of your workspace is to avoid the inevitable
+accumulation of stagnant repos.
 
-#### TUI
+By keeping your _working set_ small, you reduce the cognitive (and CPU) load
+required to search through your repos. It also makes it easier to see which
+repos have outstanding changes that need to be finished and pushed.
 
-Run `workset` without arguments to launch an interactive TUI from the current
-directory:
+Adhering to this principle manually involves frequently cloning and deleting
+repositories from your workspace which is probably more effort wasted than
+saved.
 
-```sh
-# Launch interactive repository browser
-❯ workset
+`workset` makes these mechanics _fast_ and _easy_. When repositories are dropped
+from your workspace, they are just saved locally in a library so restoring them
+later can be done in an instant.
 
-# Use j/k or arrow keys to navigate
-# Press / to fuzzy find repositories
-# Press Enter to add the selected repository to your working set
-# Press q to quit
-```
+## Control your repos
+
+Don't let Github be the only place you store your repos!
+
+**Workset** makes it easy to keep local copies of all of your repos without
+having to sift through them to find the ones you're currently working on.
+Mirroring repos to other hosting providers is also supported.

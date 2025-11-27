@@ -72,57 +72,6 @@ enum Action {
     AddRepo(String),
 }
 
-/// Message for updating repository metadata asynchronously
-enum MetadataUpdate {
-    WorkspaceTime {
-        display_name: String,
-        time_ago: String,
-    },
-    LibrarySize {
-        display_name: String,
-        size: String,
-    },
-}
-
-/// Spawn background workers to compute repository metadata
-fn spawn_metadata_workers(
-    workspace_repos: Vec<RepoInfo>,
-    library_repos: Vec<String>,
-    library_path: Option<String>,
-    tx: std::sync::mpsc::Sender<MetadataUpdate>,
-) {
-    // Spawn worker for workspace modification times
-    let tx_workspace = tx.clone();
-    std::thread::spawn(move || {
-        for repo in workspace_repos {
-            if let Ok(mod_time) = get_repo_modification_time(&repo.path, repo.is_clean) {
-                let time_ago = format_time_ago(mod_time);
-                let _ = tx_workspace.send(MetadataUpdate::WorkspaceTime {
-                    display_name: repo.display_name.clone(),
-                    time_ago,
-                });
-            }
-        }
-    });
-
-    // Spawn worker for library sizes
-    std::thread::spawn(move || {
-        if let Some(base_path) = library_path {
-            for repo_relative_path in library_repos {
-                // Combine library base path with relative path
-                let repo_path = PathBuf::from(&base_path).join(&repo_relative_path);
-                if let Ok(size_bytes) = get_repo_size(&repo_path) {
-                    let size = format_size(size_bytes);
-                    let _ = tx.send(MetadataUpdate::LibrarySize {
-                        display_name: repo_relative_path.clone(),
-                        size,
-                    });
-                }
-            }
-        }
-    });
-}
-
 /// Detect the parent shell by reading /proc/self/status
 fn detect_parent_shell() -> Option<String> {
     #[cfg(target_os = "linux")]
@@ -176,24 +125,46 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                 // A repo is only clean if it has commits, no changes, and no unpushed commits
                 let is_clean = status.has_commits && !status.has_changes && !status.has_unpushed;
 
+                // Get modification time
+                let modification_time = get_repo_modification_time(&path, is_clean).ok();
+
+                // Get size (only for workspace repos, not computed for library to save time)
+                let size_bytes = None;
+
                 RepoInfo {
                     path,
                     display_name,
                     is_clean,
-                    last_modified: None, // Will be computed asynchronously
-                    size: None,          // Will be computed asynchronously
+                    modification_time,
+                    size_bytes,
                 }
             })
             .collect();
 
-        // Collect library repositories and path
-        let (library_repos, library_path) = if let Some(library) = &workspace.library {
-            (
-                library.list().unwrap_or_default(),
-                Some(library.path.clone()),
-            )
+        // Collect library repositories
+        let library_repos: Vec<RepoInfo> = if let Some(library) = &workspace.library {
+            library
+                .list()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|repo_path| {
+                    let full_path = PathBuf::from(&library.path).join(&repo_path);
+                    // Get modification time for library repos
+                    let modification_time = get_repo_modification_time(&full_path, true).ok();
+                    // Get size for library repos
+                    let size_bytes = get_repo_size(&full_path).ok();
+
+                    RepoInfo {
+                        path: full_path,
+                        display_name: repo_path,
+                        is_clean: true, // Library repos are always clean
+                        modification_time,
+                        size_bytes,
+                    }
+                })
+                .collect()
         } else {
-            (Vec::new(), None)
+            Vec::new()
         };
 
         // Setup terminal
@@ -204,16 +175,10 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
         let mut terminal = Terminal::new(backend)?;
 
         // Create app
-        let mut app = App::new(workspace_repos.clone(), library_repos.clone());
+        let mut app = App::new(workspace_repos, library_repos);
 
-        // Create channel for metadata updates
-        let (metadata_tx, metadata_rx) = std::sync::mpsc::channel::<MetadataUpdate>();
-
-        // Spawn background threads to compute metadata
-        spawn_metadata_workers(workspace_repos, library_repos, library_path, metadata_tx);
-
-        // Run app with metadata receiver
-        let action = run_app(&mut terminal, &mut app, log_capture.clone(), metadata_rx)?;
+        // Run app
+        let action = run_app(&mut terminal, &mut app, log_capture.clone())?;
 
         // Restore terminal
         disable_raw_mode()?;
@@ -365,26 +330,10 @@ fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     log_capture: LogCapture,
-    metadata_rx: std::sync::mpsc::Receiver<MetadataUpdate>,
 ) -> Result<Action> {
     loop {
         // Update the app with the latest log message
         app.last_log_message = log_capture.get_message();
-
-        // Check for metadata updates (non-blocking)
-        while let Ok(update) = metadata_rx.try_recv() {
-            match update {
-                MetadataUpdate::WorkspaceTime {
-                    display_name,
-                    time_ago,
-                } => {
-                    app.update_workspace_metadata(&display_name, Some(time_ago), None);
-                }
-                MetadataUpdate::LibrarySize { display_name, size } => {
-                    app.update_library_metadata(&display_name, size);
-                }
-            }
-        }
 
         terminal.draw(|f| ui(f, app))?;
 
@@ -828,8 +777,9 @@ fn ui(f: &mut Frame, app: &mut App) {
 
             // Add modification time for workspace repos (right-aligned if available)
             if let Some(ref repo) = node.repo_info
-                && let Some(ref time_str) = repo.last_modified
+                && let Some(mod_time) = repo.modification_time
             {
+                let time_str = format_time_ago(mod_time);
                 let metadata_width = time_str.chars().count();
                 // Calculate padding needed to right-align (ensure at least 1 space)
                 let padding_needed = workspace_width
@@ -980,8 +930,9 @@ fn ui(f: &mut Frame, app: &mut App) {
 
             // Add size for library repos (right-aligned if available)
             if let Some(ref repo) = node.repo_info
-                && let Some(ref size_str) = repo.size
+                && let Some(size_bytes) = repo.size_bytes
             {
+                let size_str = format_size(size_bytes);
                 let metadata_width = size_str.chars().count();
                 // Calculate padding needed to right-align (ensure at least 1 space)
                 let padding_needed = library_width
