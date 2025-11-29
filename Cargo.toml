@@ -14,10 +14,9 @@ categories = ["command-line-utilities", "development-tools"]
 anyhow = "1.0.100"
 chrono = "0.4"
 cmd_lib = "1.9.6"
-crossterm = { version = "0.28", optional = true }
-enum_dispatch = "0.3"
+crossterm = { version = "0.29", optional = true }
 fuzzy-matcher = { version = "0.3", optional = true }
-gix = "0.68"
+gix = "0.75"
 home = "0.5"
 log = "0.4"
 pico-args = "0.5"
@@ -25,7 +24,6 @@ ratatui = { version = "0.29", optional = true }
 regex = "1.12.2"
 serde_json = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
-toml = "0.8.23"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2.5.0"
@@ -34,7 +32,7 @@ walkdir = "2.5.0"
 tempfile = "3"
 
 [build-dependencies]
-built = { version = "0.7", features = [
+built = { version = "0.8", features = [
   "cargo-lock",
   "dependency-tree",
   "git2",

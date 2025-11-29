@@ -1,14 +1,11 @@
 use anyhow::{Result, bail};
 use cmd_lib::run_fun;
-use remote::{ListRepos, Remote};
-use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 use tracing::{debug, info, warn};
 
-pub mod remote;
 #[cfg(feature = "tui")]
 pub mod tui;
 
@@ -72,29 +69,6 @@ impl RepoPattern {
             Some(provider) => format!("{}/{}", provider, self.path),
             None => self.path.clone(),
         }
-    }
-
-    /// Check if this pattern matches a given path
-    /// Supports exact matches and partial matches
-    pub fn matches(&self, test_path: &str) -> bool {
-        let full = self.full_path();
-
-        // Exact match
-        if test_path == full {
-            return true;
-        }
-
-        // Ends with match (for simple repo names)
-        if test_path.ends_with(&full) {
-            return true;
-        }
-
-        // Contains match for path component
-        if test_path.contains(&self.path) {
-            return true;
-        }
-
-        false
     }
 }
 
@@ -280,20 +254,11 @@ pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
 /// for example:
 ///     <workspace path>/github.com/fossable/workset
 ///
-/// This is stored in .workset.toml in the workspace root.
-#[derive(Debug, Serialize, Deserialize)]
+/// Workspace root is identified by the presence of a .workset/ directory.
+#[derive(Debug)]
 pub struct Workspace {
-    /// The workspace directory's filesystem path (not serialized, set at runtime)
-    #[serde(skip)]
+    /// The workspace directory's filesystem path
     pub path: String,
-
-    /// A list of providers for the workspace
-    #[serde(default)]
-    pub remotes: Vec<Remote>,
-
-    /// The library directory for this workspace
-    #[serde(flatten)]
-    pub library: Option<Library>,
 }
 
 impl Default for Workspace {
@@ -306,23 +271,43 @@ impl Default for Workspace {
                 .unwrap_or_else(|| home.join("workspace"))
                 .display()
                 .to_string(),
-            remotes: vec![],
-            library: Some(Library {
-                path: home.join(".workset").display().to_string(),
-            }),
         }
     }
 }
 
 impl Workspace {
+    /// Get the library path for this workspace
+    pub fn library_path(&self) -> String {
+        format!("{}/.workset", self.path)
+    }
+
+    /// Get the library path as a PathBuf (avoids allocation)
+    fn library_path_buf(&self) -> PathBuf {
+        PathBuf::from(&self.path).join(".workset")
+    }
+
     /// Load workspace from current directory.
     pub fn load() -> Result<Option<Self>> {
         let mut workspace_root = std::env::current_dir()?;
 
-        // Search up for a workspace config
-        let config_path = loop {
-            if workspace_root.join(".workset.toml").exists() {
-                break workspace_root.join(".workset.toml");
+        // Search up for a .workset/ directory
+        loop {
+            let workset_dir = workspace_root.join(".workset");
+            if workset_dir.exists() && workset_dir.is_dir() {
+                let workspace = Workspace {
+                    path: workspace_root.display().to_string(),
+                };
+
+                debug!(workspace_path = %workspace.path, "Found workspace");
+
+                // Validate the workspace configuration
+                workspace.validate()?;
+
+                // Make sure library directory exists
+                std::fs::create_dir_all(&workspace.library_path_buf())
+                    .map_err(|e| anyhow::anyhow!("Failed to create library directory: {}", e))?;
+
+                return Ok(Some(workspace));
             }
 
             // Try parent directory
@@ -330,31 +315,7 @@ impl Workspace {
                 Some(parent) => workspace_root = parent.to_path_buf(),
                 None => return Ok(None),
             }
-        };
-
-        debug!(config_path = %config_path.display(), "Loading workspace configuration");
-
-        let config_content = std::fs::read_to_string(&config_path)
-            .map_err(|e| anyhow::anyhow!("Failed to read workspace config: {}", e))?;
-
-        let mut workspace: Workspace = toml::from_str(&config_content)
-            .map_err(|e| anyhow::anyhow!("Failed to parse workspace config: {}", e))?;
-
-        // Set the workspace path to the actual root directory
-        workspace.path = workspace_root.display().to_string();
-
-        // Validate the workspace configuration
-        workspace.validate()?;
-
-        debug!(workspace = ?workspace, "Loaded workspace configuration");
-
-        // Make sure library directory exists
-        if let Some(library) = workspace.library.as_ref() {
-            std::fs::create_dir_all(&library.path)
-                .map_err(|e| anyhow::anyhow!("Failed to create library directory: {}", e))?;
         }
-
-        Ok(Some(workspace))
     }
 
     /// Validate the workspace configuration
@@ -362,25 +323,6 @@ impl Workspace {
         // Check if workspace path exists
         if !Path::new(&self.path).exists() {
             bail!("Workspace path does not exist: {}", self.path);
-        }
-
-        // Validate library path if set
-        if let Some(library) = &self.library {
-            // Check if library path is absolute or relative
-            let lib_path = Path::new(&library.path);
-            if lib_path.to_string_lossy().contains("~") {
-                warn!(
-                    "Library path contains '~' which may not expand correctly: {}",
-                    library.path
-                );
-            }
-        }
-
-        // Validate remote configurations
-        for (idx, remote) in self.remotes.iter().enumerate() {
-            if let Err(e) = remote.list_repo_paths() {
-                warn!("Remote #{} validation failed: {}", idx + 1, e);
-            }
         }
 
         Ok(())
@@ -393,7 +335,7 @@ impl Workspace {
     }
 
     /// Clone/open a repository in this workspace
-    pub fn open(&self, library: Option<&Library>, pattern: &RepoPattern) -> Result<PathBuf> {
+    pub fn open(&self, pattern: &RepoPattern) -> Result<PathBuf> {
         debug!(pattern = ?pattern, "Opening repos");
 
         // First check if repository already exists locally
@@ -414,24 +356,22 @@ impl Workspace {
         }
 
         // Check library and restore if found
-        if let Some(library) = library {
-            let relative_path = pattern.full_path();
-            let repo_path = format!("{}/{}", self.path, relative_path);
+        let relative_path = pattern.full_path();
+        let repo_path = format!("{}/{}", self.path, relative_path);
 
-            if library.exists(relative_path.clone()) {
-                info!("📦 Restoring from library: {}", relative_path);
-                library.restore_to_workspace(&self.path, &relative_path)?;
+        if self.library_contains(&relative_path) {
+            info!("📦 Restoring from library: {}", relative_path);
+            self.restore_from_library(&relative_path)?;
 
-                // Fetch latest changes from upstream
-                info!("  🔄 Fetching latest changes...");
-                if let Err(e) = self.fetch_updates(&PathBuf::from(&repo_path)) {
-                    debug!("Failed to fetch updates: {}", e);
-                    info!("  ⚠ Could not fetch updates (continuing anyway)");
-                }
-
-                info!("✓ Restored {}", relative_path);
-                return Ok(PathBuf::from(repo_path));
+            // Fetch latest changes from upstream
+            info!("  🔄 Fetching latest changes...");
+            if let Err(e) = self.fetch_updates(&PathBuf::from(&repo_path)) {
+                debug!("Failed to fetch updates: {}", e);
+                info!("  ⚠ Could not fetch updates (continuing anyway)");
             }
+
+            info!("✓ Restored {}", relative_path);
+            return Ok(PathBuf::from(repo_path));
         }
 
         // Try to clone from remotes
@@ -452,7 +392,6 @@ impl Workspace {
     /// Drop a repository from this workspace
     pub fn drop(
         &self,
-        library: Option<&Library>,
         pattern: &RepoPattern,
         delete: bool,
         force: bool,
@@ -496,17 +435,15 @@ impl Workspace {
             }
 
             if !delete {
-                if let Some(library) = library {
-                    // Store the repository in the library using workspace-relative path
-                    info!("📦 Storing {} in library", repo.display());
-                    let relative_path = repo
-                        .strip_prefix(&self.path)
-                        .unwrap_or(&repo)
-                        .to_string_lossy()
-                        .trim_start_matches('/')
-                        .to_string();
-                    library.store_from_workspace(&self.path, &relative_path)?;
-                }
+                // Store the repository in the library using workspace-relative path
+                info!("📦 Storing {} in library", repo.display());
+                let relative_path = repo
+                    .strip_prefix(&self.path)
+                    .unwrap_or(&repo)
+                    .to_string_lossy()
+                    .trim_start_matches('/')
+                    .to_string();
+                self.store_in_library(&relative_path)?;
             } else {
                 info!("🗑️  Permanently deleting {}", repo.display());
             }
@@ -520,7 +457,7 @@ impl Workspace {
     }
 
     /// Drop all repositories in the current directory
-    pub fn drop_all(&self, library: Option<&Library>, delete: bool, force: bool) -> Result<()> {
+    pub fn drop_all(&self, delete: bool, force: bool) -> Result<()> {
         use tracing::{debug, info, warn};
 
         debug!("Drop all requested in current directory");
@@ -563,17 +500,15 @@ impl Workspace {
             }
 
             if !delete {
-                if let Some(library) = library {
-                    // Store the repository in the library using workspace-relative path
-                    info!("📦 Storing {} in library", repo.display());
-                    let relative_path = repo
-                        .strip_prefix(&self.path)
-                        .unwrap_or(&repo)
-                        .to_string_lossy()
-                        .trim_start_matches('/')
-                        .to_string();
-                    library.store_from_workspace(&self.path, &relative_path)?;
-                }
+                // Store the repository in the library using workspace-relative path
+                info!("📦 Storing {} in library", repo.display());
+                let relative_path = repo
+                    .strip_prefix(&self.path)
+                    .unwrap_or(&repo)
+                    .to_string_lossy()
+                    .trim_start_matches('/')
+                    .to_string();
+                self.store_in_library(&relative_path)?;
             } else {
                 info!("🗑️  Permanently deleting {}", repo.display());
             }
@@ -624,29 +559,26 @@ impl Workspace {
         // No provider specified, would need to check configured remotes
         bail!("No provider specified. Use full path like github.com/user/repo")
     }
-}
 
-/// Stores repositories that are dropped from a `Workspace` in a library directory.
-/// Entries in the library are bare repositories for space efficiency.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Library {
-    pub path: String,
-}
+    /// Check if a repository exists in the library
+    pub fn library_contains(&self, repo_path: &str) -> bool {
+        std::fs::metadata(format!("{}/{}", self.library_path(), repo_path)).is_ok()
+    }
 
-impl Library {
     /// Move the given repository into the library.
-    /// workspace_path: the root path of the workspace
     /// relative_path: the relative path of the repo within the workspace (e.g. "github.com/user/repo")
-    pub fn store_from_workspace(&self, workspace_path: &str, relative_path: &str) -> Result<()> {
+    pub fn store_in_library(&self, relative_path: &str) -> Result<()> {
         use tracing::debug;
 
+        let library_path = self.library_path();
+
         // Make sure the library directory exists first
-        std::fs::create_dir_all(&self.path).map_err(|e| {
-            anyhow::anyhow!("Failed to create library directory {}: {}", self.path, e)
+        std::fs::create_dir_all(&library_path).map_err(|e| {
+            anyhow::anyhow!("Failed to create library directory {}: {}", library_path, e)
         })?;
 
-        let source = format!("{}/{}/.git", workspace_path, relative_path);
-        let dest = format!("{}/{}", self.path, relative_path);
+        let source = format!("{}/{}/.git", self.path, relative_path);
+        let dest = format!("{}/{}", library_path, relative_path);
 
         // Verify the source .git directory exists
         if std::fs::metadata(&source).is_err() {
@@ -678,11 +610,13 @@ impl Library {
     }
 
     /// Restore a repository from the library to the workspace.
-    /// workspace_path: the root path of the workspace
     /// relative_path: the relative path of the repo within the workspace (e.g. "github.com/user/repo")
-    pub fn restore_to_workspace(&self, workspace_path: &str, relative_path: &str) -> Result<()> {
-        let source = format!("{}/{}", self.path, relative_path);
-        let dest = format!("{}/{}", workspace_path, relative_path);
+    pub fn restore_from_library(&self, relative_path: &str) -> Result<()> {
+        use tracing::debug;
+
+        let library_path = self.library_path();
+        let source = format!("{}/{}", library_path, relative_path);
+        let dest = format!("{}/{}", self.path, relative_path);
 
         // Verify the library entry exists
         if std::fs::metadata(&source).is_err() {
@@ -698,21 +632,39 @@ impl Library {
                 .map_err(|e| anyhow::anyhow!("Failed to create parent directory: {}", e))?;
         }
 
+        // Get all remotes from the bare repository
+        let remotes_output = run_fun!(git -C $source remote)
+            .map_err(|e| anyhow::anyhow!("Failed to get remotes from library: {}", e))?;
+
+        // Clone from the library
         run_fun!(git clone $source $dest)
             .map_err(|e| anyhow::anyhow!("Failed to restore repository from library: {}", e))?;
+
+        // Restore all original remote URLs
+        for remote_name in remotes_output.lines() {
+            let remote_name = remote_name.trim();
+            if !remote_name.is_empty() {
+                // Get the URL for this remote from the library
+                if let Ok(remote_url) = run_fun!(git -C $source config --get remote.$remote_name.url) {
+                    let remote_url = remote_url.trim();
+                    debug!("Restoring remote '{}' to: {}", remote_name, remote_url);
+
+                    // Update the remote URL in the restored repository
+                    run_fun!(git -C $dest remote set-url $remote_name $remote_url)
+                        .map_err(|e| anyhow::anyhow!("Failed to restore remote '{}': {}", remote_name, e))?;
+                }
+            }
+        }
 
         Ok(())
     }
 
-    pub fn exists(&self, repo_path: String) -> bool {
-        std::fs::metadata(format!("{}/{}", self.path, repo_path)).is_ok()
-    }
-
     /// List all repositories in the library
-    pub fn list(&self) -> Result<Vec<String>> {
+    pub fn list_library(&self) -> Result<Vec<String>> {
         use tracing::debug;
 
-        if !Path::new(&self.path).exists() {
+        let library_path = self.library_path();
+        if !Path::new(&library_path).exists() {
             return Ok(Vec::new());
         }
 
@@ -744,7 +696,7 @@ impl Library {
             Ok(())
         }
 
-        find_repos(&self.path, Path::new(&self.path), &mut repos)?;
+        find_repos(&library_path, Path::new(&library_path), &mut repos)?;
 
         debug!("Found {} repositories in library", repos.len());
         repos.sort();
@@ -761,25 +713,24 @@ mod tests {
     #[test]
     fn test_workspace_default() {
         let workspace = Workspace::default();
-        assert!(workspace.library.is_some());
         assert!(!workspace.path.is_empty());
     }
 
     #[test]
-    fn test_library_exists() {
+    fn test_library_contains() {
         let temp_dir = TempDir::new().unwrap();
-        let library = Library {
+        let workspace = Workspace {
             path: temp_dir.path().to_string_lossy().to_string(),
         };
 
-        let repo_path = "/test/repo";
-        assert!(!library.exists(repo_path.to_string()));
+        let repo_path = "test/repo";
+        assert!(!workspace.library_contains(repo_path));
 
-        // Create the library directory using the normal path
-        let library_path = format!("{}{}", library.path, repo_path);
+        // Create the library directory with a test repo
+        let library_path = format!("{}/{}", workspace.library_path(), repo_path);
         fs::create_dir_all(&library_path).unwrap();
 
-        assert!(library.exists(repo_path.to_string()));
+        assert!(workspace.library_contains(repo_path));
     }
 
     #[test]

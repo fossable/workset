@@ -1,9 +1,7 @@
 use anyhow::Result;
-use std::io::Write;
 use tracing::level_filters::LevelFilter;
 use tracing::{error, info};
 use workset::Workspace;
-use workset::remote::ListRepos;
 
 /// Build info provided by built crate.
 pub mod build_info {
@@ -81,20 +79,16 @@ fn main() -> Result<()> {
     match args.subcommand()? {
         Some(command) => match command.as_str() {
             "init" => {
-                let workspace = if let Some(workspace) = maybe_workspace {
-                    info!("Workspace already exists");
-                    // TODO allow args to change config
-                    workspace
-                } else {
-                    info!("Creating workspace");
-                    Workspace::default()
-                };
+                let workspace_path = std::env::current_dir()?;
+                let library_path = workspace_path.join(".workset");
 
-                // Write or rewrite the config
-                let toml_string = toml::to_string_pretty(&workspace)?;
-                let mut file =
-                    std::fs::File::create(std::env::current_dir()?.join(".workset.toml"))?;
-                file.write_all(toml_string.as_bytes())?;
+                if library_path.exists() {
+                    info!("✓ Workspace already initialized at {}", workspace_path.display());
+                } else {
+                    std::fs::create_dir_all(&library_path)?;
+                    info!("✓ Initialized workspace at {}", workspace_path.display());
+                    info!("  Library: {}", library_path.display());
+                }
             }
             "drop" => {
                 if let Some(workspace) = maybe_workspace {
@@ -105,10 +99,10 @@ fn main() -> Result<()> {
                         let pattern: workset::RepoPattern = path
                             .parse()
                             .map_err(|e| anyhow::anyhow!("Failed to parse pattern: {}", e))?;
-                        workspace.drop(workspace.library.as_ref(), &pattern, delete, force)?;
+                        workspace.drop(&pattern, delete, force)?;
                     } else {
                         // Drop all repos in current directory
-                        workspace.drop_all(workspace.library.as_ref(), delete, force)?;
+                        workspace.drop_all(delete, force)?;
                     }
                 } else {
                     error!("You're not in a workspace");
@@ -133,7 +127,7 @@ fn main() -> Result<()> {
                     let pattern: workset::RepoPattern = command
                         .parse()
                         .map_err(|e| anyhow::anyhow!("Failed to parse pattern: {}", e))?;
-                    workspace.open(workspace.library.as_ref(), &pattern)?;
+                    workspace.open(&pattern)?;
                 } else {
                     error!("You're not in a workspace");
                 }
@@ -197,20 +191,9 @@ fn show_workspace_summary(workspace: &Workspace) -> Result<()> {
     println!();
 
     // Show library information
-    if let Some(library) = &workspace.library {
-        println!("Library: {}", library.path);
-        if let Ok(repos) = library.list() {
-            println!("  {} repository(ies) in library", repos.len());
-        }
-    }
-
-    // Show configured remotes
-    if !workspace.remotes.is_empty() {
-        println!();
-        println!("Configured remotes:");
-        for (idx, remote) in workspace.remotes.iter().enumerate() {
-            println!("  {}. {:?}", idx + 1, remote);
-        }
+    println!("Library: {}", workspace.library_path());
+    if let Ok(repos) = workspace.list_library() {
+        println!("  {} repository(ies) in library", repos.len());
     }
 
     // Count repositories in workspace
@@ -250,9 +233,12 @@ fn show_workspace_summary(workspace: &Workspace) -> Result<()> {
 fn get_repo_completions(workspace: &Workspace) -> Vec<String> {
     let mut repos = Vec::new();
 
-    for remote in &workspace.remotes {
-        if let Ok(paths) = remote.list_repo_paths() {
-            repos.extend(paths);
+    // Only complete with local workspace repos
+    if let Ok(local_repos) = workset::find_git_repositories(&workspace.path) {
+        for repo in local_repos {
+            if let Ok(relative) = repo.strip_prefix(&workspace.path) {
+                repos.push(relative.display().to_string());
+            }
         }
     }
 
@@ -317,40 +303,15 @@ fn complete_fish(maybe_workspace: Option<Workspace>) -> Result<()> {
 mod tests {
     use super::*;
     use workset::Workspace;
-    #[cfg(feature = "github")]
-    use workset::remote::github::GithubRemote;
 
     #[test]
-    #[cfg(feature = "github")]
-    fn test_get_repo_completions() {
-        // Create a test workspace with a GitHub remote
-        let remote = GithubRemote {
-            user: "testuser".to_string(),
-            include_forks: false,
-            include_archived: false,
-        };
-
+    fn test_get_repo_completions_empty() {
         let workspace = Workspace {
-            path: "/test".to_string(),
-            remotes: vec![remote.into()],
-            library: None,
-        };
-
-        // Note: This will actually try to fetch from GitHub API
-        // For a proper test, we'd need to mock the HTTP calls
-        let _completions = get_repo_completions(&workspace);
-        // Can't assert much here without mocking, but at least test it doesn't panic
-    }
-
-    #[test]
-    fn test_get_repo_completions_no_remotes() {
-        let workspace = Workspace {
-            path: "/test".to_string(),
-            remotes: vec![],
-            library: None,
+            path: "/nonexistent".to_string(),
         };
 
         let completions = get_repo_completions(&workspace);
+        // Should be empty since the path doesn't exist
         assert_eq!(completions.len(), 0);
     }
 }

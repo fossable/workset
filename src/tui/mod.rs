@@ -6,10 +6,6 @@ use app::{App, AppMode, Section};
 use metadata::{format_size, format_time_ago, get_repo_modification_time, get_repo_size};
 use tree::RepoInfo;
 
-#[cfg(feature = "github")]
-use crate::remote::github;
-#[cfg(feature = "gitlab")]
-use crate::remote::gitlab;
 use crate::{Workspace, check_repo_status, find_git_repositories};
 use anyhow::Result;
 use crossterm::{
@@ -109,65 +105,8 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
 
     loop {
         // Collect workspace repositories
-        let workspace_repos: Vec<RepoInfo> = find_git_repositories(&workspace.path)?
-            .into_iter()
-            .map(|path| {
-                let display_name = path
-                    .strip_prefix(&workspace.path)
-                    .unwrap_or(&path)
-                    .display()
-                    .to_string()
-                    .trim_start_matches('/')
-                    .to_string();
-
-                // Check repo status in a single pass for performance
-                let status = check_repo_status(&path).unwrap_or(crate::RepoStatus::NoCommits);
-                // A repo is only clean if it has commits, no changes, and no unpushed commits
-                let is_clean = matches!(status, crate::RepoStatus::Clean);
-
-                // Get modification time
-                let modification_time = get_repo_modification_time(&path, is_clean).ok();
-
-                // Get size (only for workspace repos, not computed for library to save time)
-                let size_bytes = None;
-
-                RepoInfo {
-                    path,
-                    display_name,
-                    is_clean,
-                    modification_time,
-                    size_bytes,
-                    operation_status: tree::RepoOperationStatus::None,
-                }
-            })
-            .collect();
-
-        // Collect library repositories
-        let library_repos: Vec<RepoInfo> = if let Some(library) = &workspace.library {
-            library
-                .list()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|repo_path| {
-                    let full_path = PathBuf::from(&library.path).join(&repo_path);
-                    // Get modification time for library repos
-                    let modification_time = get_repo_modification_time(&full_path, true).ok();
-                    // Get size for library repos
-                    let size_bytes = get_repo_size(&full_path).ok();
-
-                    RepoInfo {
-                        path: full_path,
-                        display_name: repo_path,
-                        is_clean: true, // Library repos are always clean
-                        modification_time,
-                        size_bytes,
-                        operation_status: tree::RepoOperationStatus::None,
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let workspace_repos = collect_workspace_repos(&workspace);
+        let library_repos = collect_library_repos(&workspace);
 
         // Setup terminal
         enable_raw_mode()?;
@@ -247,7 +186,7 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                         }
                     };
 
-                    match workspace.drop(workspace.library.as_ref(), &pattern, false, false) {
+                    match workspace.drop(&pattern, false, false) {
                         Ok(_) => {
                             app.update_repo_status(repo_path, tree::RepoOperationStatus::Success);
                             success_count += 1;
@@ -274,52 +213,8 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                 std::thread::sleep(std::time::Duration::from_millis(500));
 
                 // Reload repository data and rebuild the app state
-                let workspace_repos: Vec<RepoInfo> = find_git_repositories(&workspace.path)?
-                    .into_iter()
-                    .map(|path| {
-                        let display_name = path
-                            .strip_prefix(&workspace.path)
-                            .unwrap_or(&path)
-                            .display()
-                            .to_string()
-                            .trim_start_matches('/')
-                            .to_string();
-                        let status = check_repo_status(&path).unwrap_or(crate::RepoStatus::NoCommits);
-                        let is_clean = matches!(status, crate::RepoStatus::Clean);
-                        let modification_time = get_repo_modification_time(&path, is_clean).ok();
-                        RepoInfo {
-                            path,
-                            display_name,
-                            is_clean,
-                            modification_time,
-                            size_bytes: None,
-                            operation_status: tree::RepoOperationStatus::None,
-                        }
-                    })
-                    .collect();
-
-                let library_repos: Vec<RepoInfo> = if let Some(library) = &workspace.library {
-                    library
-                        .list()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|repo_path| {
-                            let full_path = PathBuf::from(&library.path).join(&repo_path);
-                            let modification_time = get_repo_modification_time(&full_path, true).ok();
-                            let size_bytes = get_repo_size(&full_path).ok();
-                            RepoInfo {
-                                path: full_path,
-                                display_name: repo_path,
-                                is_clean: true,
-                                modification_time,
-                                size_bytes,
-                                operation_status: tree::RepoOperationStatus::None,
-                            }
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
+                let workspace_repos = collect_workspace_repos(&workspace);
+                let library_repos = collect_library_repos(&workspace);
 
                 // Rebuild app with fresh data
                 app = App::new(workspace_repos, library_repos);
@@ -340,11 +235,7 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                     // Small delay so user can see the status change
                     std::thread::sleep(std::time::Duration::from_millis(100));
 
-                    let result = if let Some(library) = &workspace.library {
-                        library.restore_to_workspace(&workspace.path, repo_path)
-                    } else {
-                        Ok(())
-                    };
+                    let result = workspace.restore_from_library(repo_path);
 
                     match result {
                         Ok(_) => {
@@ -373,52 +264,8 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                 std::thread::sleep(std::time::Duration::from_millis(500));
 
                 // Reload repository data and rebuild the app state
-                let workspace_repos: Vec<RepoInfo> = find_git_repositories(&workspace.path)?
-                    .into_iter()
-                    .map(|path| {
-                        let display_name = path
-                            .strip_prefix(&workspace.path)
-                            .unwrap_or(&path)
-                            .display()
-                            .to_string()
-                            .trim_start_matches('/')
-                            .to_string();
-                        let status = check_repo_status(&path).unwrap_or(crate::RepoStatus::NoCommits);
-                        let is_clean = matches!(status, crate::RepoStatus::Clean);
-                        let modification_time = get_repo_modification_time(&path, is_clean).ok();
-                        RepoInfo {
-                            path,
-                            display_name,
-                            is_clean,
-                            modification_time,
-                            size_bytes: None,
-                            operation_status: tree::RepoOperationStatus::None,
-                        }
-                    })
-                    .collect();
-
-                let library_repos: Vec<RepoInfo> = if let Some(library) = &workspace.library {
-                    library
-                        .list()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|repo_path| {
-                            let full_path = PathBuf::from(&library.path).join(&repo_path);
-                            let modification_time = get_repo_modification_time(&full_path, true).ok();
-                            let size_bytes = get_repo_size(&full_path).ok();
-                            RepoInfo {
-                                path: full_path,
-                                display_name: repo_path,
-                                is_clean: true,
-                                modification_time,
-                                size_bytes,
-                                operation_status: tree::RepoOperationStatus::None,
-                            }
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
+                let workspace_repos = collect_workspace_repos(&workspace);
+                let library_repos = collect_library_repos(&workspace);
 
                 // Rebuild app with fresh data
                 app = App::new(workspace_repos, library_repos);
@@ -440,7 +287,7 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("Failed to parse pattern: {}", e))?;
 
                 // Add the repository
-                match workspace.open(workspace.library.as_ref(), &pattern) {
+                match workspace.open(&pattern) {
                     Ok(_) => {
                         log_capture.set_message(format!("✓ Added repository {}", repo_pattern))
                     }
@@ -502,9 +349,9 @@ fn run_app<B: ratatui::backend::Backend>(
                         // Fetch suggestions in background (blocking for now)
                         let mut suggestions = Vec::new();
                         #[cfg(feature = "github")]
-                        suggestions.extend(github::get_suggestions());
+                        suggestions.extend(get_github_suggestions());
                         #[cfg(feature = "gitlab")]
-                        suggestions.extend(gitlab::get_suggestions());
+                        suggestions.extend(get_gitlab_suggestions());
                         suggestions.sort();
                         suggestions.dedup();
                         app.add_repo_suggestions = suggestions;
@@ -829,71 +676,20 @@ fn ui(f: &mut Frame, app: &mut App) {
                     && app.search_query.contains(&format!("{}/", node.name));
 
                 // Try to match against the full path for this node
-                if should_highlight_dir
+                let indices = if should_highlight_dir
                     || app
                         .matcher
                         .fuzzy_indices(full_path, &app.search_query)
                         .is_some()
                 {
-                    if let Some((_, indices)) =
-                        app.matcher.fuzzy_indices(full_path, &app.search_query)
-                    {
-                        let mut last_pos = 0;
-                        let chars: Vec<(usize, char)> = node.name.char_indices().collect();
-
-                        // Find which indices apply to just the node name (not full path)
-                        let path_offset = full_path.len() - node.name.len();
-
-                        for &match_idx in &indices {
-                            if match_idx < path_offset {
-                                continue; // Skip matches in path prefix
-                            }
-                            let local_idx = match_idx - path_offset;
-
-                            if local_idx >= chars.len() {
-                                continue;
-                            }
-
-                            // Add unmatched text before this character
-                            if local_idx > last_pos {
-                                let start_byte = chars[last_pos].0;
-                                let end_byte = chars[local_idx].0;
-                                spans.push(Span::raw(&node.name[start_byte..end_byte]));
-                            }
-
-                            // Add highlighted character
-                            let char_byte_start = chars[local_idx].0;
-                            let char_byte_end = if local_idx + 1 < chars.len() {
-                                chars[local_idx + 1].0
-                            } else {
-                                node.name.len()
-                            };
-                            spans.push(Span::styled(
-                                &node.name[char_byte_start..char_byte_end],
-                                Style::default().fg(Color::Black).bg(Color::Yellow),
-                            ));
-
-                            last_pos = local_idx + 1;
-                        }
-
-                        // Add remaining text
-                        if last_pos < chars.len() {
-                            let start_byte = chars[last_pos].0;
-                            spans.push(Span::raw(&node.name[start_byte..]));
-                        } else if last_pos == 0 {
-                            // No matches in name portion, show normally
-                            spans.push(Span::raw(&node.name));
-                        }
-                    } else if should_highlight_dir {
-                        // Directory is part of search path, highlight entire name
-                        spans.push(Span::styled(
-                            &node.name,
-                            Style::default().fg(Color::Black).bg(Color::Yellow),
-                        ));
-                    }
+                    app.matcher
+                        .fuzzy_indices(full_path, &app.search_query)
+                        .map(|(_, idx)| idx)
                 } else {
-                    spans.push(Span::raw(&node.name));
-                }
+                    None
+                };
+
+                spans.extend(render_highlighted_name(&node.name, full_path, should_highlight_dir, indices));
             } else {
                 spans.push(Span::raw(&node.name));
             }
@@ -921,16 +717,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                     tree::RepoOperationStatus::Failed(err) => (format!("failed: {}", err), Color::Red),
                 };
 
-                if !status_text.is_empty() {
-                    let metadata_width = status_text.chars().count();
-                    // Calculate padding needed to right-align (ensure at least 1 space)
-                    let padding_needed = workspace_width
-                        .saturating_sub(text_width)
-                        .saturating_sub(metadata_width)
-                        .max(1);
-                    spans.push(Span::raw(" ".repeat(padding_needed)));
-                    spans.push(Span::styled(status_text, Style::default().fg(status_color)));
-                }
+                spans.extend(render_metadata_span(text_width, workspace_width, status_text, status_color));
             }
 
             ListItem::new(Line::from(spans))
@@ -996,71 +783,20 @@ fn ui(f: &mut Frame, app: &mut App) {
                     && app.search_query.contains(&format!("{}/", node.name));
 
                 // Try to match against the full path for this node
-                if should_highlight_dir
+                let indices = if should_highlight_dir
                     || app
                         .matcher
                         .fuzzy_indices(full_path, &app.search_query)
                         .is_some()
                 {
-                    if let Some((_, indices)) =
-                        app.matcher.fuzzy_indices(full_path, &app.search_query)
-                    {
-                        let mut last_pos = 0;
-                        let chars: Vec<(usize, char)> = node.name.char_indices().collect();
-
-                        // Find which indices apply to just the node name (not full path)
-                        let path_offset = full_path.len() - node.name.len();
-
-                        for &match_idx in &indices {
-                            if match_idx < path_offset {
-                                continue; // Skip matches in path prefix
-                            }
-                            let local_idx = match_idx - path_offset;
-
-                            if local_idx >= chars.len() {
-                                continue;
-                            }
-
-                            // Add unmatched text before this character
-                            if local_idx > last_pos {
-                                let start_byte = chars[last_pos].0;
-                                let end_byte = chars[local_idx].0;
-                                spans.push(Span::raw(&node.name[start_byte..end_byte]));
-                            }
-
-                            // Add highlighted character
-                            let char_byte_start = chars[local_idx].0;
-                            let char_byte_end = if local_idx + 1 < chars.len() {
-                                chars[local_idx + 1].0
-                            } else {
-                                node.name.len()
-                            };
-                            spans.push(Span::styled(
-                                &node.name[char_byte_start..char_byte_end],
-                                Style::default().fg(Color::Black).bg(Color::Yellow),
-                            ));
-
-                            last_pos = local_idx + 1;
-                        }
-
-                        // Add remaining text
-                        if last_pos < chars.len() {
-                            let start_byte = chars[last_pos].0;
-                            spans.push(Span::raw(&node.name[start_byte..]));
-                        } else if last_pos == 0 {
-                            // No matches in name portion, show normally
-                            spans.push(Span::raw(&node.name));
-                        }
-                    } else if should_highlight_dir {
-                        // Directory is part of search path, highlight entire name
-                        spans.push(Span::styled(
-                            &node.name,
-                            Style::default().fg(Color::Black).bg(Color::Yellow),
-                        ));
-                    }
+                    app.matcher
+                        .fuzzy_indices(full_path, &app.search_query)
+                        .map(|(_, idx)| idx)
                 } else {
-                    spans.push(Span::raw(&node.name));
-                }
+                    None
+                };
+
+                spans.extend(render_highlighted_name(&node.name, full_path, should_highlight_dir, indices));
             } else {
                 spans.push(Span::raw(&node.name));
             }
@@ -1088,16 +824,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                     tree::RepoOperationStatus::Failed(err) => (format!("failed: {}", err), Color::Red),
                 };
 
-                if !status_text.is_empty() {
-                    let metadata_width = status_text.chars().count();
-                    // Calculate padding needed to right-align (ensure at least 1 space)
-                    let padding_needed = library_width
-                        .saturating_sub(text_width)
-                        .saturating_sub(metadata_width)
-                        .max(1);
-                    spans.push(Span::raw(" ".repeat(padding_needed)));
-                    spans.push(Span::styled(status_text, Style::default().fg(status_color)));
-                }
+                spans.extend(render_metadata_span(text_width, library_width, status_text, status_color));
             }
 
             ListItem::new(Line::from(spans))
@@ -1245,3 +972,201 @@ fn render_add_repo_dialog(f: &mut Frame, app: &App) {
     f.render_stateful_widget(suggestions, chunks[1], &mut state);
 }
 
+/// Render right-aligned metadata (status or size) with padding
+fn render_metadata_span<'a>(
+    text_width: usize,
+    available_width: usize,
+    metadata_text: String,
+    metadata_color: Color,
+) -> Vec<Span<'a>> {
+    let mut spans = vec![];
+
+    if !metadata_text.is_empty() {
+        let metadata_width = metadata_text.chars().count();
+        // Calculate padding needed to right-align (ensure at least 1 space)
+        let padding_needed = available_width
+            .saturating_sub(text_width)
+            .saturating_sub(metadata_width)
+            .max(1);
+        spans.push(Span::raw(" ".repeat(padding_needed)));
+        spans.push(Span::styled(metadata_text, Style::default().fg(metadata_color)));
+    }
+
+    spans
+}
+
+/// Render highlighted name with character-by-character fuzzy match highlighting
+fn render_highlighted_name<'a>(
+    node_name: &'a str,
+    full_path: &str,
+    should_highlight_dir: bool,
+    indices: Option<Vec<usize>>,
+) -> Vec<Span<'a>> {
+    let mut spans = vec![];
+
+    if let Some(indices) = indices {
+        let mut last_pos = 0;
+        let chars: Vec<(usize, char)> = node_name.char_indices().collect();
+
+        // Find which indices apply to just the node name (not full path)
+        let path_offset = full_path.len() - node_name.len();
+
+        for &match_idx in &indices {
+            if match_idx < path_offset {
+                continue; // Skip matches in path prefix
+            }
+            let local_idx = match_idx - path_offset;
+
+            if local_idx >= chars.len() {
+                continue;
+            }
+
+            // Add unmatched text before this character
+            if local_idx > last_pos {
+                let start_byte = chars[last_pos].0;
+                let end_byte = chars[local_idx].0;
+                spans.push(Span::raw(&node_name[start_byte..end_byte]));
+            }
+
+            // Add highlighted character
+            let char_byte_start = chars[local_idx].0;
+            let char_byte_end = if local_idx + 1 < chars.len() {
+                chars[local_idx + 1].0
+            } else {
+                node_name.len()
+            };
+            spans.push(Span::styled(
+                &node_name[char_byte_start..char_byte_end],
+                Style::default().fg(Color::Black).bg(Color::Yellow),
+            ));
+
+            last_pos = local_idx + 1;
+        }
+
+        // Add remaining text
+        if last_pos < chars.len() {
+            let start_byte = chars[last_pos].0;
+            spans.push(Span::raw(&node_name[start_byte..]));
+        } else if last_pos == 0 {
+            // No matches in name portion, show normally
+            spans.push(Span::raw(node_name));
+        }
+    } else if should_highlight_dir {
+        // Directory is part of search path, highlight entire name
+        spans.push(Span::styled(
+            node_name,
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        ));
+    } else {
+        spans.push(Span::raw(node_name));
+    }
+
+    spans
+}
+
+/// Collect workspace repositories with metadata
+fn collect_workspace_repos(workspace: &Workspace) -> Vec<RepoInfo> {
+    find_git_repositories(&workspace.path)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|path| {
+            let display_name = path
+                .strip_prefix(&workspace.path)
+                .unwrap_or(&path)
+                .display()
+                .to_string()
+                .trim_start_matches('/')
+                .to_string();
+
+            // Check repo status in a single pass for performance
+            let status = check_repo_status(&path).unwrap_or(crate::RepoStatus::NoCommits);
+            // A repo is only clean if it has commits, no changes, and no unpushed commits
+            let is_clean = matches!(status, crate::RepoStatus::Clean);
+
+            // Get modification time
+            let modification_time = get_repo_modification_time(&path, is_clean).ok();
+
+            // Size not computed for workspace repos to save time
+            let size_bytes = None;
+
+            RepoInfo {
+                path,
+                display_name,
+                is_clean,
+                modification_time,
+                size_bytes,
+                operation_status: tree::RepoOperationStatus::None,
+            }
+        })
+        .collect()
+}
+
+/// Collect library repositories with metadata
+fn collect_library_repos(workspace: &Workspace) -> Vec<RepoInfo> {
+    workspace
+        .list_library()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|repo_path| {
+            let full_path = PathBuf::from(&workspace.library_path()).join(&repo_path);
+            // Get modification time for library repos
+            let modification_time = get_repo_modification_time(&full_path, true).ok();
+            // Get size for library repos
+            let size_bytes = get_repo_size(&full_path).ok();
+
+            RepoInfo {
+                path: full_path,
+                display_name: repo_path,
+                is_clean: true, // Library repos are always clean
+                modification_time,
+                size_bytes,
+                operation_status: tree::RepoOperationStatus::None,
+            }
+        })
+        .collect()
+}
+
+/// Fetch repository suggestions from GitHub CLI for TUI autocomplete
+#[cfg(feature = "github")]
+fn get_github_suggestions() -> Vec<String> {
+    if let Ok(output) = std::process::Command::new("gh")
+        .args([
+            "repo",
+            "list",
+            "--limit",
+            "100",
+            "--json",
+            "nameWithOwner",
+            "-q",
+            ".[].nameWithOwner",
+        ])
+        .output()
+        && output.status.success()
+    {
+        return String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| format!("github.com/{}", line.trim()))
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Fetch repository suggestions from GitLab CLI for TUI autocomplete
+#[cfg(feature = "gitlab")]
+fn get_gitlab_suggestions() -> Vec<String> {
+    if let Ok(output) = std::process::Command::new("glab")
+        .args(["repo", "list", "--all", "--per-page", "100"])
+        .output()
+        && output.status.success()
+    {
+        return String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                // glab output format is: "namespace/project"
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                parts.first().map(|repo| format!("gitlab.com/{}", repo))
+            })
+            .collect();
+    }
+    Vec::new()
+}
