@@ -22,9 +22,12 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
+use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event as NotifyEvent};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::time::{Duration, Instant};
 
 /// Shared state for capturing log messages
 #[derive(Clone)]
@@ -66,6 +69,7 @@ enum Action {
     DropToLibrary(Vec<String>),
     RestoreFromLibrary(Vec<String>),
     CloneRepo(String),
+    RefreshData,
 }
 
 /// Detect the parent shell by reading /proc/self/status
@@ -118,10 +122,49 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
         // Create app
         let mut app = App::new(workspace_repos, library_repos);
 
+        // Setup filesystem watcher with debouncing
+        let (watcher_tx, watcher_rx) = channel();
+        let workspace_path = PathBuf::from(&workspace.path);
+
+        // Shared state for debouncing
+        let last_event = Arc::new(Mutex::new(Instant::now()));
+        let debounce_duration = Duration::from_millis(500);
+
+        let watcher_tx_clone = watcher_tx.clone();
+        let last_event_clone = last_event.clone();
+
+        let mut watcher = RecommendedWatcher::new(
+            move |res: Result<NotifyEvent, notify::Error>| {
+                if let Ok(event) = res {
+                    // Ignore events in .git directories and .workset library
+                    let should_ignore = event.paths.iter().any(|path| {
+                        path.components().any(|c| {
+                            c.as_os_str() == ".git" || c.as_os_str() == ".workset"
+                        })
+                    });
+
+                    if !should_ignore {
+                        let mut last = last_event_clone.lock().unwrap();
+                        let now = Instant::now();
+
+                        // Only send if enough time has passed since last event
+                        if now.duration_since(*last) > debounce_duration {
+                            *last = now;
+                            let _ = watcher_tx_clone.send(());
+                        }
+                    }
+                }
+            },
+            notify::Config::default(),
+        )?;
+
+        // Watch the workspace directory recursively
+        watcher.watch(&workspace_path, RecursiveMode::Recursive)?;
+
         // Inner loop to handle actions without tearing down terminal
         loop {
-            // Run app
-            let action = run_app(&mut terminal, &mut app, log_capture.clone())?;
+            // Run app with the watcher receiver
+            let action = run_app(&mut terminal, &mut app, log_capture.clone(), &watcher_rx)?;
 
             // Handle the action
             match action {
@@ -310,6 +353,15 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                         Err(e) => log_capture.set_message(format!("✗ Failed to clone: {}", e)),
                     }
                 }
+                Action::RefreshData => {
+                    // Filesystem changed - reload repository data
+                    let workspace_repos = collect_workspace_repos(workspace);
+                    let library_repos = collect_library_repos(workspace);
+
+                    // Rebuild app with fresh data
+                    app = App::new(workspace_repos, library_repos);
+                    app.last_log_message = log_capture.get_message();
+                }
             } // End of action match
         } // End of inner loop
     } // End of outer loop
@@ -319,6 +371,7 @@ fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     log_capture: LogCapture,
+    watcher_rx: &Receiver<()>,
 ) -> Result<Action> {
     loop {
         // Update the app with the latest log message
@@ -326,8 +379,22 @@ fn run_app<B: ratatui::backend::Backend>(
 
         terminal.draw(|f| ui(f, app))?;
 
-        // Use poll with timeout to allow checking for metadata updates periodically
-        if event::poll(std::time::Duration::from_millis(100))?
+        // Check for filesystem changes
+        match watcher_rx.try_recv() {
+            Ok(_) => {
+                // Filesystem changed - signal refresh needed
+                return Ok(Action::RefreshData);
+            }
+            Err(TryRecvError::Disconnected) => {
+                // Watcher died - continue without watching
+            }
+            Err(TryRecvError::Empty) => {
+                // No changes - continue
+            }
+        }
+
+        // Use poll with timeout to allow checking for filesystem updates periodically
+        if event::poll(Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
         {
             match app.mode {
@@ -365,6 +432,22 @@ fn run_app<B: ratatui::backend::Backend>(
                         suggestions.extend(get_gitlab_suggestions());
                         suggestions.sort();
                         suggestions.dedup();
+
+                        // Filter out repos that already exist in workspace or library
+                        let existing_repos: std::collections::HashSet<String> = app
+                            .get_flattened_workspace()
+                            .iter()
+                            .chain(app.get_flattened_library().iter())
+                            .filter_map(|(node, _, _, _)| {
+                                node.repo_info.as_ref().map(|r| r.display_name.clone())
+                            })
+                            .collect();
+
+                        suggestions.retain(|s| {
+                            // Extract the repo name from the suggestion (e.g., "github.com/user/repo" -> "github.com/user/repo")
+                            !existing_repos.contains(s)
+                        });
+
                         app.clone_repo_suggestions = suggestions;
 
                         if !app.clone_repo_suggestions.is_empty() {
