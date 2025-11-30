@@ -180,7 +180,7 @@ pub fn build_tree(mut repos: Vec<RepoInfo>) -> Vec<TreeNode> {
                 let new_node = if is_last {
                     TreeNode::new_repo(repo.clone())
                 } else {
-                    TreeNode::new_directory(part.to_string())
+                    TreeNode::new_directory((*part).to_string())
                 };
                 current_level.push(new_node);
                 let new_idx = current_level.len() - 1;

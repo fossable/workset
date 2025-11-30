@@ -27,8 +27,8 @@ All `workset` commands run in reference to the current directory.
 # Initialize a new workspace in the current directory
 ❯ workset init
 
-# Add (clone) a repository to your workspace
-❯ workset github.com/jqlang/jq
+# Add a repository to your workspace
+❯ workset clone github.com/jqlang/jq
 
 # The repository's local path always reflects the remote path
 ❯ cd ./github.com/jqlang/jq
@@ -45,7 +45,7 @@ All `workset` commands run in reference to the current directory.
 ❯ workset drop --delete ./delete_this_repo
 
 # When you need to work on a repository again, it's restored from the local library
-❯ workset jq
+❯ workset restore jq
 ```
 
 The shell autocomplete is smart enough to look at your CWD and suggest repos

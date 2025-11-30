@@ -271,17 +271,17 @@ pub fn format_time_ago(time: std::time::SystemTime) -> String {
         // Under 1 day: show hours (rounded)
         let hours = (seconds + 1800) / 3600; // Round to nearest hour
         format!("{}h", hours)
-    } else if seconds < 2592000 {
+    } else if seconds < 2_592_000 {
         // Under 30 days: show days (rounded)
         let days = (seconds + 43200) / 86400; // Round to nearest day
         format!("{}d", days)
-    } else if seconds < 31536000 {
+    } else if seconds < 31_536_000 {
         // Under 1 year: show months (rounded)
-        let months = (seconds + 1296000) / 2592000; // Round to nearest month
+        let months = (seconds + 1_296_000) / 2_592_000; // Round to nearest month
         format!("{}mo", months)
     } else {
         // Over 1 year: show years (rounded)
-        let years = (seconds + 15768000) / 31536000; // Round to nearest year
+        let years = (seconds + 15_768_000) / 31_536_000; // Round to nearest year
         format!("{}y", years)
     }
 }

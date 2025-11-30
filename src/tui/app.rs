@@ -8,7 +8,7 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 #[derive(PartialEq)]
 pub enum AppMode {
     Normal,
-    AddRepo,
+    CloneRepo,
 }
 
 #[derive(PartialEq)]
@@ -31,9 +31,9 @@ pub struct App {
     pub matcher: SkimMatcherV2,
     pub last_log_message: String,
     pub mode: AppMode,
-    pub add_repo_input: String,
-    pub add_repo_suggestions: Vec<String>,
-    pub add_repo_state: TreeState,
+    pub clone_repo_input: String,
+    pub clone_repo_suggestions: Vec<String>,
+    pub clone_repo_state: TreeState,
 }
 
 impl App {
@@ -72,9 +72,9 @@ impl App {
             matcher: SkimMatcherV2::default(),
             last_log_message: String::new(),
             mode: AppMode::Normal,
-            add_repo_input: String::new(),
-            add_repo_suggestions: Vec::new(),
-            add_repo_state: TreeState::new(),
+            clone_repo_input: String::new(),
+            clone_repo_suggestions: Vec::new(),
+            clone_repo_state: TreeState::new(),
         }
     }
 

@@ -65,7 +65,7 @@ enum Action {
     OpenShell(PathBuf),
     DropToLibrary(Vec<String>),
     RestoreFromLibrary(Vec<String>),
-    AddRepo(String),
+    CloneRepo(String),
 }
 
 /// Detect the parent shell by reading /proc/self/status
@@ -232,9 +232,6 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                     // Rebuild app with fresh data
                     app = App::new(workspace_repos, library_repos);
                     app.last_log_message = log_capture.get_message();
-
-                    // Continue inner loop without tearing down terminal
-                    continue;
                 }
                 Action::RestoreFromLibrary(repo_paths) => {
                     let mut success_count = 0;
@@ -292,14 +289,11 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                     // Rebuild app with fresh data
                     app = App::new(workspace_repos, library_repos);
                     app.last_log_message = log_capture.get_message();
-
-                    // Continue inner loop without tearing down terminal
-                    continue;
                 }
-                Action::AddRepo(repo_pattern) => {
+                Action::CloneRepo(repo_pattern) => {
                     use crate::RepoPattern;
 
-                    log_capture.set_message(format!("🔄 Adding repository {}...", repo_pattern));
+                    log_capture.set_message(format!("🔄 Cloning repository {}...", repo_pattern));
                     // Force a redraw to show the message immediately
                     app.last_log_message = log_capture.get_message();
                     terminal.draw(|f| ui(f, &mut app))?;
@@ -308,16 +302,13 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                         .parse()
                         .map_err(|e| anyhow::anyhow!("Failed to parse pattern: {}", e))?;
 
-                    // Add the repository
+                    // Clone the repository
                     match workspace.open(&pattern) {
                         Ok(_) => {
-                            log_capture.set_message(format!("✓ Added repository {}", repo_pattern))
+                            log_capture.set_message(format!("✓ Cloned repository {}", repo_pattern))
                         }
-                        Err(e) => log_capture.set_message(format!("✗ Failed to add: {}", e)),
+                        Err(e) => log_capture.set_message(format!("✗ Failed to clone: {}", e)),
                     }
-
-                    // Loop back to refresh TUI
-                    continue;
                 }
             } // End of action match
         } // End of inner loop
@@ -364,22 +355,20 @@ fn run_app<B: ratatui::backend::Backend>(
                         app.toggle_expand();
                     }
                     KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Ctrl+A = add repo dialog
-                        app.mode = AppMode::AddRepo;
-                        app.add_repo_input.clear();
+                        // Ctrl+A = clone repo dialog
+                        app.mode = AppMode::CloneRepo;
+                        app.clone_repo_input.clear();
 
                         // Fetch suggestions in background (blocking for now)
                         let mut suggestions = Vec::new();
-                        #[cfg(feature = "github")]
                         suggestions.extend(get_github_suggestions());
-                        #[cfg(feature = "gitlab")]
                         suggestions.extend(get_gitlab_suggestions());
                         suggestions.sort();
                         suggestions.dedup();
-                        app.add_repo_suggestions = suggestions;
+                        app.clone_repo_suggestions = suggestions;
 
-                        if !app.add_repo_suggestions.is_empty() {
-                            app.add_repo_state.select(Some(0));
+                        if !app.clone_repo_suggestions.is_empty() {
+                            app.clone_repo_state.select(Some(0));
                         }
                     }
                     KeyCode::Esc => return Ok(Action::None),
@@ -449,80 +438,80 @@ fn run_app<B: ratatui::backend::Backend>(
                     }
                     _ => {}
                 },
-                AppMode::AddRepo => match key.code {
+                AppMode::CloneRepo => match key.code {
                     KeyCode::Esc => {
                         app.mode = AppMode::Normal;
-                        app.add_repo_input.clear();
+                        app.clone_repo_input.clear();
                     }
                     KeyCode::Enter => {
                         // Use selected suggestion or manual input
-                        let repo = if let Some(idx) = app.add_repo_state.selected() {
+                        let repo = if let Some(idx) = app.clone_repo_state.selected() {
                             // Filter suggestions by current input
                             let filtered: Vec<_> = app
-                                .add_repo_suggestions
+                                .clone_repo_suggestions
                                 .iter()
                                 .filter(|s| {
                                     s.to_lowercase()
-                                        .contains(&app.add_repo_input.to_lowercase())
+                                        .contains(&app.clone_repo_input.to_lowercase())
                                 })
                                 .collect();
 
-                            filtered.get(idx).map(|s| s.to_string())
+                            filtered.get(idx).map(|s| (*s).to_string())
                         } else {
                             None
                         };
 
-                        let repo = repo.unwrap_or_else(|| app.add_repo_input.clone());
+                        let repo = repo.unwrap_or_else(|| app.clone_repo_input.clone());
 
                         if !repo.is_empty() {
                             app.mode = AppMode::Normal;
-                            return Ok(Action::AddRepo(repo));
+                            return Ok(Action::CloneRepo(repo));
                         }
                     }
                     KeyCode::Down => {
                         let filtered: Vec<_> = app
-                            .add_repo_suggestions
+                            .clone_repo_suggestions
                             .iter()
                             .filter(|s| {
                                 s.to_lowercase()
-                                    .contains(&app.add_repo_input.to_lowercase())
+                                    .contains(&app.clone_repo_input.to_lowercase())
                             })
                             .collect();
 
                         if !filtered.is_empty() {
-                            let next = match app.add_repo_state.selected() {
+                            let next = match app.clone_repo_state.selected() {
                                 Some(i) if i >= filtered.len() - 1 => 0,
                                 Some(i) => i + 1,
                                 None => 0,
                             };
-                            app.add_repo_state.select(Some(next));
+                            app.clone_repo_state.select(Some(next));
                         }
                     }
                     KeyCode::Up => {
                         let filtered: Vec<_> = app
-                            .add_repo_suggestions
+                            .clone_repo_suggestions
                             .iter()
                             .filter(|s| {
                                 s.to_lowercase()
-                                    .contains(&app.add_repo_input.to_lowercase())
+                                    .contains(&app.clone_repo_input.to_lowercase())
                             })
                             .collect();
 
                         if !filtered.is_empty() {
-                            let prev = match app.add_repo_state.selected() {
+                            let prev = match app.clone_repo_state.selected() {
                                 Some(0) => filtered.len() - 1,
                                 Some(i) => i - 1,
                                 None => 0,
                             };
-                            app.add_repo_state.select(Some(prev));
+                            app.clone_repo_state.select(Some(prev));
                         }
                     }
                     KeyCode::Char(c) => {
-                        app.add_repo_input.push(c);
-                        app.add_repo_state.select(Some(0));
+                        app.clone_repo_input.push(c);
+                        app.clone_repo_state.select(Some(0));
                     }
                     KeyCode::Backspace => {
-                        app.add_repo_input.pop();
+                        app.clone_repo_input.pop();
                     }
                     _ => {}
                 },
@@ -532,8 +521,8 @@ fn run_app<B: ratatui::backend::Backend>(
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
-    if app.mode == AppMode::AddRepo {
-        render_add_repo_dialog(f, app);
+    if app.mode == AppMode::CloneRepo {
+        render_clone_repo_dialog(f, app);
         return;
     }
 
@@ -596,6 +585,13 @@ fn ui(f: &mut Frame, app: &mut App) {
             ),
             Span::raw(" drop  "),
             Span::styled(
+                "Ctrl+A",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" clone  "),
+            Span::styled(
                 "Esc",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
@@ -637,7 +633,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                     .fg(Color::Magenta)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" add  "),
+            Span::raw(" clone  "),
             Span::styled(
                 "Esc",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -939,7 +935,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(status, vertical_chunks[3]);
 }
 
-fn render_add_repo_dialog(f: &mut Frame, app: &App) {
+fn render_clone_repo_dialog(f: &mut Frame, app: &App) {
     use ratatui::layout::Rect;
 
     // Create a centered dialog
@@ -960,7 +956,7 @@ fn render_add_repo_dialog(f: &mut Frame, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title("Add Repository")
+        .title("Clone Repository")
         .style(Style::default().bg(Color::Black));
     f.render_widget(block, dialog_area);
 
@@ -979,7 +975,7 @@ fn render_add_repo_dialog(f: &mut Frame, app: &App) {
         .split(inner);
 
     // Input box
-    let input_text = format!("{}_", app.add_repo_input);
+    let input_text = format!("{}_", app.clone_repo_input);
     let input = Paragraph::new(input_text)
         .style(Style::default().fg(Color::Yellow))
         .block(
@@ -991,14 +987,14 @@ fn render_add_repo_dialog(f: &mut Frame, app: &App) {
 
     // Suggestions list
     let filtered_suggestions: Vec<_> = app
-        .add_repo_suggestions
+        .clone_repo_suggestions
         .iter()
         .filter(|s| {
-            if app.add_repo_input.is_empty() {
+            if app.clone_repo_input.is_empty() {
                 true
             } else {
                 s.to_lowercase()
-                    .contains(&app.add_repo_input.to_lowercase())
+                    .contains(&app.clone_repo_input.to_lowercase())
             }
         })
         .collect();
@@ -1022,7 +1018,7 @@ fn render_add_repo_dialog(f: &mut Frame, app: &App) {
         .highlight_symbol(">> ");
 
     let mut state = ratatui::widgets::ListState::default();
-    state.select(app.add_repo_state.selected());
+    state.select(app.clone_repo_state.selected());
     f.render_stateful_widget(suggestions, chunks[1], &mut state);
 }
 
@@ -1184,7 +1180,6 @@ fn collect_library_repos(workspace: &Workspace) -> Vec<RepoInfo> {
 }
 
 /// Fetch repository suggestions from GitHub CLI for TUI autocomplete
-#[cfg(feature = "github")]
 fn get_github_suggestions() -> Vec<String> {
     if let Ok(output) = std::process::Command::new("gh")
         .args([
@@ -1209,7 +1204,6 @@ fn get_github_suggestions() -> Vec<String> {
 }
 
 /// Fetch repository suggestions from GitLab CLI for TUI autocomplete
-#[cfg(feature = "gitlab")]
 fn get_gitlab_suggestions() -> Vec<String> {
     if let Ok(output) = std::process::Command::new("glab")
         .args(["repo", "list", "--all", "--per-page", "100"])

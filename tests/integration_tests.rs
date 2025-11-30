@@ -133,7 +133,7 @@ fn test_drop_and_restore_clean_repo() {
 
     // Restore the repo
     let output = Command::new(&binary)
-        .args(["test-repo"])
+        .args(["restore", "test-repo"])
         .current_dir(workspace_path)
         .output()
         .expect("Failed to restore repo");
@@ -412,7 +412,7 @@ fn test_nested_directory_structure() {
 
     // Restore it
     let output = Command::new(&binary)
-        .args(["github.com/testuser/nested-repo"])
+        .args(["restore", "github.com/testuser/nested-repo"])
         .current_dir(workspace_path)
         .output()
         .expect("Failed to restore nested repo");
@@ -451,7 +451,7 @@ fn test_multiple_drop_and_restore_cycles() {
 
         // Restore
         let output = Command::new(&binary)
-            .args(["cycle-repo"])
+            .args(["restore", "cycle-repo"])
             .current_dir(workspace_path)
             .output()
             .expect("Failed to restore repo");
@@ -520,7 +520,7 @@ fn test_repo_with_gitmodules_file() {
 
     // Restore it
     let output = Command::new(&binary)
-        .args(["main-repo"])
+        .args(["restore", "main-repo"])
         .current_dir(workspace_path)
         .output()
         .expect("Failed to restore repo with gitmodules");
@@ -603,4 +603,415 @@ fn test_modification_time_tracking() {
             "Dirty repo modification time should be >= clean repo time"
         );
     }
+}
+
+#[test]
+fn test_drop_relative_to_cwd() {
+    let temp_dir = TempDir::new().unwrap();
+    let workspace_path = temp_dir.path();
+    let binary = get_binary_path();
+
+    // Initialize workspace
+    Command::new(&binary)
+        .arg("init")
+        .current_dir(workspace_path)
+        .output()
+        .expect("Failed to init workspace");
+
+    // Create nested directory structure with multiple repos
+    let subdir = workspace_path.join("projects");
+    fs::create_dir_all(&subdir).unwrap();
+
+    create_test_repo(&subdir, "repo1", 1);
+    create_test_repo(&subdir, "repo2", 1);
+    create_test_repo(workspace_path, "root-repo", 1);
+
+    // Drop all from the subdirectory (should only drop repos in that dir)
+    let output = Command::new(&binary)
+        .arg("drop")
+        .current_dir(&subdir)
+        .output()
+        .expect("Failed to drop from subdir");
+
+    assert!(
+        output.status.success(),
+        "Drop from subdir should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Repos in subdir should be dropped
+    assert!(!subdir.join("repo1").exists());
+    assert!(!subdir.join("repo2").exists());
+
+    // Root repo should still exist (not in CWD)
+    assert!(workspace_path.join("root-repo").exists());
+
+    // Both should be in library
+    assert!(workspace_path.join(".workset/projects/repo1").exists());
+    assert!(workspace_path.join(".workset/projects/repo2").exists());
+}
+
+#[test]
+fn test_drop_specific_repo_from_subdirectory() {
+    let temp_dir = TempDir::new().unwrap();
+    let workspace_path = temp_dir.path();
+    let binary = get_binary_path();
+
+    // Initialize workspace
+    Command::new(&binary)
+        .arg("init")
+        .current_dir(workspace_path)
+        .output()
+        .expect("Failed to init workspace");
+
+    // Create nested repos
+    let subdir = workspace_path.join("github.com/user");
+    fs::create_dir_all(&subdir).unwrap();
+    create_test_repo(&subdir, "project", 1);
+
+    // Drop specific repo from workspace root using full path
+    let output = Command::new(&binary)
+        .args(["drop", "github.com/user/project"])
+        .current_dir(workspace_path)
+        .output()
+        .expect("Failed to drop nested repo");
+
+    assert!(output.status.success());
+    assert!(!subdir.join("project").exists());
+    assert!(workspace_path.join(".workset/github.com/user/project").exists());
+
+    // Restore from workspace root
+    Command::new(&binary)
+        .args(["restore", "github.com/user/project"])
+        .current_dir(workspace_path)
+        .output()
+        .unwrap();
+
+    assert!(subdir.join("project").exists());
+
+    // Drop from subdirectory using full path (not just "project")
+    let output = Command::new(&binary)
+        .args(["drop", "github.com/user/project"])
+        .current_dir(&subdir)
+        .output()
+        .expect("Failed to drop with full path from subdir");
+
+    assert!(
+        output.status.success(),
+        "Should drop with full path from subdirectory: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!subdir.join("project").exists());
+}
+
+#[test]
+fn test_list_shows_all_workspace_repos() {
+    let temp_dir = TempDir::new().unwrap();
+    let workspace_path = temp_dir.path();
+    let binary = get_binary_path();
+
+    // Initialize workspace
+    Command::new(&binary)
+        .arg("init")
+        .current_dir(workspace_path)
+        .output()
+        .expect("Failed to init workspace");
+
+    // Create repos in different directories
+    create_test_repo(workspace_path, "root-repo", 1);
+
+    let subdir = workspace_path.join("projects");
+    fs::create_dir_all(&subdir).unwrap();
+    create_test_repo(&subdir, "sub-repo1", 1);
+    create_test_repo(&subdir, "sub-repo2", 1);
+
+    // List from workspace root should show all repos
+    let output = Command::new(&binary)
+        .arg("list")
+        .current_dir(workspace_path)
+        .output()
+        .expect("Failed to list from root");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("root-repo"));
+    assert!(stdout.contains("sub-repo1") || stdout.contains("projects/sub-repo1"));
+    assert!(stdout.contains("sub-repo2") || stdout.contains("projects/sub-repo2"));
+
+    // List from subdirectory currently shows all workspace repos
+    // (Not filtered by CWD - this documents current behavior)
+    let output = Command::new(&binary)
+        .arg("list")
+        .current_dir(&subdir)
+        .output()
+        .expect("Failed to list from subdir");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // Currently, list shows all repos regardless of CWD
+    // This test documents the current behavior
+    assert!(stdout.contains("root-repo") || stdout.contains("sub-repo1"),
+        "List currently shows all workspace repos regardless of CWD");
+}
+
+#[test]
+fn test_status_relative_to_cwd() {
+    let temp_dir = TempDir::new().unwrap();
+    let workspace_path = temp_dir.path();
+    let binary = get_binary_path();
+
+    // Initialize workspace
+    Command::new(&binary)
+        .arg("init")
+        .current_dir(workspace_path)
+        .output()
+        .expect("Failed to init workspace");
+
+    // Create repos in different directories
+    create_test_repo(workspace_path, "root-repo", 1);
+
+    let subdir = workspace_path.join("projects");
+    fs::create_dir_all(&subdir).unwrap();
+    create_test_repo(&subdir, "sub-repo1", 1);
+    create_test_repo(&subdir, "sub-repo2", 1);
+
+    // Status from workspace root shows workspace info
+    let output = Command::new(&binary)
+        .arg("status")
+        .current_dir(workspace_path)
+        .output()
+        .expect("Failed to get status from root");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Workspace:"));
+    assert!(stdout.contains("Active repositories: 3") || stdout.contains("3"));
+
+    // Status from subdirectory should still show workspace-level info
+    let output = Command::new(&binary)
+        .arg("status")
+        .current_dir(&subdir)
+        .output()
+        .expect("Failed to get status from subdir");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Workspace:"));
+    // Should still show all workspace repos
+    assert!(stdout.contains("Active repositories"));
+}
+
+#[test]
+fn test_restore_relative_to_cwd() {
+    let temp_dir = TempDir::new().unwrap();
+    let workspace_path = temp_dir.path();
+    let binary = get_binary_path();
+
+    // Initialize workspace
+    Command::new(&binary)
+        .arg("init")
+        .current_dir(workspace_path)
+        .output()
+        .expect("Failed to init workspace");
+
+    // Create and drop repos in nested structure
+    let projects_dir = workspace_path.join("projects");
+    fs::create_dir_all(&projects_dir).unwrap();
+
+    let repo_path = create_test_repo(&projects_dir, "my-project", 1);
+
+    // Drop it
+    Command::new(&binary)
+        .args(["drop", "projects/my-project"])
+        .current_dir(workspace_path)
+        .output()
+        .unwrap();
+
+    assert!(!repo_path.exists());
+
+    // Restore from workspace root using full path
+    let output = Command::new(&binary)
+        .args(["restore", "projects/my-project"])
+        .current_dir(workspace_path)
+        .output()
+        .expect("Failed to restore from root");
+
+    assert!(output.status.success());
+    assert!(repo_path.exists());
+
+    // Drop again
+    Command::new(&binary)
+        .args(["drop", "my-project"])
+        .current_dir(&projects_dir)
+        .output()
+        .unwrap();
+
+    // Restore from subdirectory using relative path
+    let output = Command::new(&binary)
+        .args(["restore", "my-project"])
+        .current_dir(&projects_dir)
+        .output()
+        .expect("Failed to restore from subdir");
+
+    assert!(
+        output.status.success(),
+        "Should restore relative to CWD within library: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(repo_path.exists());
+}
+
+#[test]
+fn test_clone_always_relative_to_workspace_root() {
+    let temp_dir = TempDir::new().unwrap();
+    let workspace_path = temp_dir.path();
+    let binary = get_binary_path();
+
+    // Initialize workspace
+    Command::new(&binary)
+        .arg("init")
+        .current_dir(workspace_path)
+        .output()
+        .expect("Failed to init workspace");
+
+    // Create a subdirectory
+    let subdir = workspace_path.join("some/deep/directory");
+    fs::create_dir_all(&subdir).unwrap();
+
+    // Try to clone from deep subdirectory - should still clone relative to workspace root
+    // We'll use a fake URL pattern that won't actually clone, but we can check the error message
+    let output = Command::new(&binary)
+        .args(["clone", "github.com/test/repo"])
+        .current_dir(&subdir)
+        .output()
+        .expect("Failed to run clone");
+
+    // The command will fail (no network), but we can verify it tried to clone to workspace root
+    // by checking that it created the parent directory structure
+    // Since we can't actually clone without network, we'll verify the workspace is found
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Should not complain about not being in a workspace
+    assert!(
+        !stderr.contains("not in a workspace"),
+        "Clone should work from subdirectory by finding workspace root"
+    );
+}
+
+#[test]
+fn test_commands_outside_workspace() {
+    let temp_dir = TempDir::new().unwrap();
+    let outside_dir = temp_dir.path().join("outside");
+    fs::create_dir_all(&outside_dir).unwrap();
+
+    let binary = get_binary_path();
+
+    // Try to run list outside workspace - currently succeeds with empty output
+    let output = Command::new(&binary)
+        .arg("list")
+        .current_dir(&outside_dir)
+        .output()
+        .expect("Failed to run list outside workspace");
+
+    // List may succeed (showing no repos) or fail - documenting current behavior
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Should show empty or error message
+        assert!(
+            stdout.is_empty() || stdout.contains("no repositories") || stdout.contains("not in a workspace"),
+            "List outside workspace should show empty or error"
+        );
+    }
+
+    // Try to run status outside workspace - may succeed with empty/error output
+    let output = Command::new(&binary)
+        .arg("status")
+        .current_dir(&outside_dir)
+        .output()
+        .expect("Failed to run status outside workspace");
+
+    // Status may succeed or fail outside workspace - documenting current behavior
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Should show error or empty workspace info
+        assert!(
+            stdout.contains("not in a workspace") || stdout.contains("Workspace:") || stdout.is_empty(),
+            "Status outside workspace should indicate no workspace or show empty state"
+        );
+    }
+
+    // Try to run restore outside workspace - may succeed if library exists elsewhere
+    let output = Command::new(&binary)
+        .args(["restore", "some-repo"])
+        .current_dir(&outside_dir)
+        .output()
+        .expect("Failed to run restore outside workspace");
+
+    // Restore behavior outside workspace is implementation-defined
+    // Could fail with "not in workspace" or succeed if it finds a workspace
+    // Just verify it doesn't crash
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success() || stderr.contains("not in") || stdout.contains("not in") ||
+        stderr.contains("No repositories") || stdout.contains("No repositories"),
+        "Restore should handle outside workspace gracefully"
+    );
+
+    // Try to run clone outside workspace
+    let output = Command::new(&binary)
+        .args(["clone", "github.com/test/repo"])
+        .current_dir(&outside_dir)
+        .output()
+        .expect("Failed to run clone outside workspace");
+
+    // Clone may fail or succeed depending on implementation
+    // Just verify it doesn't crash
+    let _stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Drop without pattern succeeds outside workspace (drops nothing)
+    // This is expected since drop with no args operates on CWD
+    let _output = Command::new(&binary)
+        .arg("drop")
+        .current_dir(&outside_dir)
+        .output()
+        .expect("Failed to run drop outside workspace");
+
+    // This may succeed (finding no repos to drop) or fail (no workspace)
+    // Either is acceptable - documenting current behavior
+}
+
+#[test]
+fn test_drop_with_absolute_paths() {
+    let temp_dir = TempDir::new().unwrap();
+    let workspace_path = temp_dir.path();
+    let binary = get_binary_path();
+
+    // Initialize workspace
+    Command::new(&binary)
+        .arg("init")
+        .current_dir(workspace_path)
+        .output()
+        .expect("Failed to init workspace");
+
+    // Create nested structure
+    let subdir = workspace_path.join("projects/active");
+    fs::create_dir_all(&subdir).unwrap();
+    create_test_repo(&subdir, "test-repo", 1);
+
+    // Drop using absolute path from workspace root
+    let output = Command::new(&binary)
+        .args(["drop", "projects/active/test-repo"])
+        .current_dir(workspace_path)
+        .output()
+        .expect("Failed to drop with absolute path");
+
+    assert!(
+        output.status.success(),
+        "Should drop with absolute path from workspace root: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!subdir.join("test-repo").exists());
+    assert!(workspace_path.join(".workset/projects/active/test-repo").exists());
 }

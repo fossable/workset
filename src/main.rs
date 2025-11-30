@@ -19,6 +19,208 @@ mod colors {
     pub const DIM: &str = "\x1b[2m";
 }
 
+/// Clone repositories matching the pattern
+fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<()> {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    // Check if pattern is for mass cloning from github.com or gitlab.com
+    if let Some((provider, path)) = pattern.provider_and_path() {
+        // Check if this is a partial path for mass cloning
+        if (provider == "github.com" || provider == "gitlab.com") && !path.contains('/') {
+            // This is a user/org pattern like "github.com/user" - use gh/glab to mass clone
+            info!("🔄 Fetching list of repositories from {}/{}...", provider, path);
+
+            // Get list of repos using gh/glab
+            let output = if provider == "github.com" {
+                Command::new("gh")
+                    .args(["repo", "list", path, "--json", "nameWithOwner", "--limit", "1000"])
+                    .output()
+                    .map_err(|e| anyhow::anyhow!("Failed to run 'gh'. Is it installed? Error: {}", e))?
+            } else {
+                Command::new("glab")
+                    .args(["repo", "list", path, "--page", "1", "--per-page", "100"])
+                    .output()
+                    .map_err(|e| anyhow::anyhow!("Failed to run 'glab'. Is it installed? Error: {}", e))?
+            };
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("Failed to fetch repository list: {}", stderr);
+            }
+
+            // Parse the output
+            let repos = if provider == "github.com" {
+                // Parse JSON output from gh
+                let json_str = String::from_utf8(output.stdout)?;
+                let repos_json: Vec<serde_json::Value> = serde_json::from_str(&json_str)?;
+                repos_json
+                    .iter()
+                    .filter_map(|r| r["nameWithOwner"].as_str())
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            } else {
+                // Parse glab output (simple list format)
+                String::from_utf8(output.stdout)?
+                    .lines()
+                    .map(|line| line.trim().to_string())
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<_>>()
+            };
+
+            if repos.is_empty() {
+                info!("No repositories found for {}/{}", provider, path);
+                return Ok(());
+            }
+
+            info!("Found {} repositories. Cloning...", repos.len());
+
+            let mut cloned = 0;
+            let mut skipped = 0;
+
+            for repo in repos {
+                let repo_pattern: workset::RepoPattern = format!("{}/{}", provider, repo)
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("Failed to parse repo pattern: {}", e))?;
+
+                // Check if repo already exists in workspace
+                let repo_path = PathBuf::from(&workspace.path).join(repo_pattern.full_path());
+                if repo_path.exists() {
+                    info!("⊘ Skipping {} (already exists)", repo_pattern.full_path());
+                    skipped += 1;
+                    continue;
+                }
+
+                // Clone the individual repo
+                match clone_single_repo(workspace, &repo_pattern) {
+                    Ok(_) => {
+                        cloned += 1;
+                    }
+                    Err(e) => {
+                        error!("✗ Failed to clone {}: {}", repo_pattern.full_path(), e);
+                    }
+                }
+            }
+
+            info!("✓ Cloned {} repositories ({} skipped)", cloned, skipped);
+            return Ok(());
+        }
+    }
+
+    // Not a mass clone pattern, just clone the single repo
+    clone_single_repo(workspace, pattern)?;
+    Ok(())
+}
+
+/// Clone a single repository
+fn clone_single_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<()> {
+    use std::path::PathBuf;
+
+    let repo_path = PathBuf::from(&workspace.path).join(pattern.full_path());
+
+    // Check if repo already exists in workspace
+    if repo_path.exists() {
+        info!("✓ Repository already exists: {}", pattern.full_path());
+        return Ok(());
+    }
+
+    // Check if it exists in library first
+    if workspace.library_contains(&pattern.full_path()) {
+        info!("📦 Repository found in library, use 'restore' instead");
+        return Ok(());
+    }
+
+    // Clone from remote
+    if let Some((provider, repo_path_str)) = pattern.provider_and_path() {
+        let clone_url = format!("https://{}/{}", provider, repo_path_str);
+        let dest_path = format!("{}/{}", workspace.path, pattern.full_path());
+
+        // Create parent directories
+        if let Some(parent) = std::path::Path::new(&dest_path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        info!("🔄 Cloning {}...", pattern.full_path());
+
+        let output = std::process::Command::new("git")
+            .args(["clone", &clone_url, &dest_path])
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("Failed to clone: {}", stderr);
+        }
+
+        info!("✓ Cloned {}", pattern.full_path());
+        Ok(())
+    } else {
+        anyhow::bail!("No provider specified. Use format like github.com/user/repo");
+    }
+}
+
+/// Restore repositories from library matching the pattern
+fn restore_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<()> {
+    use std::path::PathBuf;
+
+    // Get all repos from library
+    let library_repos = workspace.list_library()?;
+
+    if library_repos.is_empty() {
+        info!("Library is empty");
+        return Ok(());
+    }
+
+    // Filter repos that match the pattern
+    let pattern_str = pattern.full_path();
+    let matching_repos: Vec<String> = library_repos
+        .iter()
+        .filter(|repo| repo.contains(&pattern_str))
+        .cloned()
+        .collect();
+
+    if matching_repos.is_empty() {
+        info!("No repositories found in library matching: {}", pattern_str);
+        info!("Available repositories in library:");
+        for repo in library_repos.iter().take(10) {
+            info!("  - {}", repo);
+        }
+        if library_repos.len() > 10 {
+            info!("  ... and {} more", library_repos.len() - 10);
+        }
+        return Ok(());
+    }
+
+    info!("Found {} matching repository(ies) in library", matching_repos.len());
+
+    let mut restored = 0;
+    let mut skipped = 0;
+
+    for repo_path in matching_repos {
+        // Check if already exists in workspace
+        let dest_path = PathBuf::from(&workspace.path).join(&repo_path);
+        if dest_path.exists() {
+            info!("⊘ Skipping {} (already in workspace)", repo_path);
+            skipped += 1;
+            continue;
+        }
+
+        // Restore from library
+        info!("📦 Restoring {}...", repo_path);
+        match workspace.restore_from_library(&repo_path) {
+            Ok(_) => {
+                info!("✓ Restored {}", repo_path);
+                restored += 1;
+            }
+            Err(e) => {
+                error!("✗ Failed to restore {}: {}", repo_path, e);
+            }
+        }
+    }
+
+    info!("✓ Restored {} repository(ies) ({} skipped)", restored, skipped);
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // Initialize logging
     tracing_subscriber::fmt()
@@ -53,12 +255,14 @@ fn main() -> Result<()> {
 
 {usage_header}
   {cmd}workset{reset} init
-  {cmd}workset{reset} <repo pattern>
+  {cmd}workset{reset} clone <repo pattern>
+  {cmd}workset{reset} restore <repo pattern>
   {cmd}workset{reset} drop [repo pattern] [--delete] [--force]
 
 {commands_header}
   {subcmd}init{reset}                                 Initialize a workspace in current directory
-  {subcmd}<pattern>{reset}                            Add a repository to your working set
+  {subcmd}clone{reset} {arg}<pattern>{reset}                      Clone new repository(ies) to workspace
+  {subcmd}restore{reset} {arg}<pattern>{reset}                    Restore repository(ies) from library
   {subcmd}drop{reset} {arg}[pattern]{reset} {arg}[--delete]{reset} {arg}[--force]{reset}  Drop repository(ies) from workspace
 {dim}                                       Without pattern: drops all in current directory
                                        With --delete: permanently delete (don't store)
@@ -68,12 +272,13 @@ fn main() -> Result<()> {
 
 {examples_header}
   {cmd}workset init{reset}                              Initialize workspace here
-  {cmd}workset github.com/user/repo{reset}              Add a repository
-  {cmd}workset repo{reset}                              Restore 'repo' from library
+  {cmd}workset clone github.com/user/repo{reset}        Clone a new repository
+  {cmd}workset clone github.com/user{reset}             Clone all repos from github.com/user
+  {cmd}workset restore repo{reset}                      Restore 'repo' from library
   {cmd}workset drop ./repo{reset}                       Drop repo (save to library)
   {cmd}workset drop{reset}                              Drop all repos in current dir
   {cmd}workset drop --delete ./old_repo{reset}          Permanently delete a repo
-  {cmd}workset drop --force ./dirty_repo{reset}         Force drop repo with changes
+  {cmd}workset drop --force ./dirty_repo{reset}         Force drop repo and lose any changes
 "#,
             workset = if is_tty {
                 format!("{}{}{}", colors::BOLD, "workset", colors::RESET)
@@ -135,6 +340,36 @@ fn main() -> Result<()> {
                     info!("  Library: {}", library_path.display());
                 }
             }
+            "clone" => {
+                if let Some(workspace) = maybe_workspace {
+                    if let Some(pattern_str) = args.opt_free_from_str::<String>()? {
+                        let pattern: workset::RepoPattern = pattern_str
+                            .parse()
+                            .map_err(|e| anyhow::anyhow!("Failed to parse pattern: {}", e))?;
+                        clone_repos(&workspace, &pattern)?;
+                    } else {
+                        error!("Missing repository pattern for clone command");
+                        error!("Usage: workset clone <pattern>");
+                    }
+                } else {
+                    error!("You're not in a workspace");
+                }
+            }
+            "restore" => {
+                if let Some(workspace) = maybe_workspace {
+                    if let Some(pattern_str) = args.opt_free_from_str::<String>()? {
+                        let pattern: workset::RepoPattern = pattern_str
+                            .parse()
+                            .map_err(|e| anyhow::anyhow!("Failed to parse pattern: {}", e))?;
+                        restore_repos(&workspace, &pattern)?;
+                    } else {
+                        error!("Missing repository pattern for restore command");
+                        error!("Usage: workset restore <pattern>");
+                    }
+                } else {
+                    error!("You're not in a workspace");
+                }
+            }
             "drop" => {
                 if let Some(workspace) = maybe_workspace {
                     let delete = args.contains("--delete");
@@ -168,14 +403,8 @@ fn main() -> Result<()> {
                 }
             }
             _ => {
-                if let Some(workspace) = maybe_workspace {
-                    let pattern: workset::RepoPattern = command
-                        .parse()
-                        .map_err(|e| anyhow::anyhow!("Failed to parse pattern: {}", e))?;
-                    workspace.open(&pattern)?;
-                } else {
-                    error!("You're not in a workspace");
-                }
+                error!("Unknown command: {}", command);
+                error!("Run 'workset --help' for usage information");
             }
         },
         None => {
@@ -360,14 +589,30 @@ fn complete_bash(maybe_workspace: Option<Workspace>) -> Result<()> {
     if words.len() <= 1 {
         // Complete subcommands
         if maybe_workspace.is_some() {
+            println!("clone");
+            println!("restore");
             println!("drop");
+            println!("list");
+            println!("ls");
+            println!("status");
         } else {
             println!("init");
         }
     } else if let Some(workspace) = maybe_workspace {
-        // Complete repository paths
-        for repo in get_repo_completions(&workspace) {
-            println!("{}", repo);
+        // Complete repository paths based on the subcommand
+        let subcommand = words.get(1).unwrap_or(&"");
+        if *subcommand == "restore" {
+            // For restore, complete from library
+            if let Ok(library_repos) = workspace.list_library() {
+                for repo in library_repos {
+                    println!("{}", repo);
+                }
+            }
+        } else {
+            // For drop and other commands, complete from workspace
+            for repo in get_repo_completions(&workspace) {
+                println!("{}", repo);
+            }
         }
     }
 
@@ -383,14 +628,30 @@ fn complete_fish(maybe_workspace: Option<Workspace>) -> Result<()> {
     if words.len() <= 1 || (words.len() == 2 && !comp_line.ends_with(' ')) {
         // Complete subcommands
         if maybe_workspace.is_some() {
+            println!("clone\tClone new repository(ies) to workspace");
+            println!("restore\tRestore repository(ies) from library");
             println!("drop\tDrop one or more repositories");
+            println!("list\tList all repositories with their status");
+            println!("ls\tList all repositories with their status");
+            println!("status\tShow workspace summary and statistics");
         } else {
             println!("init\tInitialize a workspace in current directory");
         }
     } else if let Some(workspace) = maybe_workspace {
-        // Complete repository paths with status and modification time
-        for (repo_name, description) in get_repo_completions_with_metadata(&workspace) {
-            println!("{}\t{}", repo_name, description);
+        // Complete repository paths based on the subcommand
+        let subcommand = words.get(1).unwrap_or(&"");
+        if *subcommand == "restore" {
+            // For restore, complete from library
+            if let Ok(library_repos) = workspace.list_library() {
+                for repo in library_repos {
+                    println!("{}\tlibrary", repo);
+                }
+            }
+        } else {
+            // For drop and other commands, complete from workspace with metadata
+            for (repo_name, description) in get_repo_completions_with_metadata(&workspace) {
+                println!("{}\t{}", repo_name, description);
+            }
         }
     }
 
@@ -525,8 +786,9 @@ mod tests {
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(output.status.success());
 
-        // In a workspace, should suggest "drop"
-        assert_eq!(stdout.trim(), "drop");
+        // In a workspace, should suggest all subcommands
+        let expected = "clone\nrestore\ndrop\nlist\nls\nstatus";
+        assert_eq!(stdout.trim(), expected);
     }
 
     #[test]
@@ -619,8 +881,9 @@ mod tests {
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(output.status.success());
 
-        // In a workspace, should suggest "drop" with description
-        assert_eq!(stdout.trim(), "drop\tDrop one or more repositories");
+        // In a workspace, should suggest all subcommands
+        let expected = "clone\tClone new repository(ies) to workspace\nrestore\tRestore repository(ies) from library\ndrop\tDrop one or more repositories\nlist\tList all repositories with their status\nls\tList all repositories with their status\nstatus\tShow workspace summary and statistics";
+        assert_eq!(stdout.trim(), expected);
     }
 
     #[test]
@@ -694,8 +957,9 @@ mod tests {
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(output.status.success());
 
-        // Should still suggest "drop" command
-        assert_eq!(stdout.trim(), "drop\tDrop one or more repositories");
+        // Should suggest all subcommands (fish completes even with partial input)
+        let expected = "clone\tClone new repository(ies) to workspace\nrestore\tRestore repository(ies) from library\ndrop\tDrop one or more repositories\nlist\tList all repositories with their status\nls\tList all repositories with their status\nstatus\tShow workspace summary and statistics";
+        assert_eq!(stdout.trim(), expected);
     }
 
     #[test]
@@ -750,8 +1014,9 @@ mod tests {
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(output.status.success());
 
-        // Should suggest commands
-        assert_eq!(stdout.trim(), "drop");
+        // Should suggest all commands
+        let expected = "clone\nrestore\ndrop\nlist\nls\nstatus";
+        assert_eq!(stdout.trim(), expected);
     }
 
     #[test]
@@ -770,8 +1035,9 @@ mod tests {
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(output.status.success());
 
-        // Should suggest commands with description
-        assert_eq!(stdout.trim(), "drop\tDrop one or more repositories");
+        // Should suggest all commands with descriptions
+        let expected = "clone\tClone new repository(ies) to workspace\nrestore\tRestore repository(ies) from library\ndrop\tDrop one or more repositories\nlist\tList all repositories with their status\nls\tList all repositories with their status\nstatus\tShow workspace summary and statistics";
+        assert_eq!(stdout.trim(), expected);
     }
 
     #[test]
@@ -791,8 +1057,9 @@ mod tests {
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(output.status.success());
 
-        // Should still suggest "drop"
-        assert_eq!(stdout.trim(), "drop");
+        // Should suggest all commands
+        let expected = "clone\nrestore\ndrop\nlist\nls\nstatus";
+        assert_eq!(stdout.trim(), expected);
     }
 
     #[test]
@@ -866,7 +1133,8 @@ mod tests {
         assert!(output.status.success());
 
         // With COMP_POINT=0, current_line is empty, so words.len() <= 1
-        assert_eq!(stdout.trim(), "drop");
+        let expected = "clone\nrestore\ndrop\nlist\nls\nstatus";
+        assert_eq!(stdout.trim(), expected);
     }
 
     #[test]
