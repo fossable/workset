@@ -146,9 +146,9 @@ pub fn build_tree(mut repos: Vec<RepoInfo>) -> Vec<TreeNode> {
     repos.sort_by(|a, b| {
         match (a.modification_time, b.modification_time) {
             (Some(a_time), Some(b_time)) => b_time.cmp(&a_time), // Most recent first
-            (Some(_), None) => std::cmp::Ordering::Less,          // Items with time come first
-            (None, Some(_)) => std::cmp::Ordering::Greater,       // Items without time come last
-            (None, None) => a.display_name.cmp(&b.display_name),  // Fallback to name
+            (Some(_), None) => std::cmp::Ordering::Less,         // Items with time come first
+            (None, Some(_)) => std::cmp::Ordering::Greater,      // Items without time come last
+            (None, None) => a.display_name.cmp(&b.display_name), // Fallback to name
         }
     });
 

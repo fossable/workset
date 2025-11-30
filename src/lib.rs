@@ -249,6 +249,124 @@ pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
     }
 }
 
+/// Format a SystemTime as a human-readable "time ago" string
+pub fn format_time_ago(time: std::time::SystemTime) -> String {
+    let elapsed = match std::time::SystemTime::now().duration_since(time) {
+        Ok(d) => d,
+        Err(_) => {
+            // Time is in the future, should not happen
+            return "just now".to_string();
+        }
+    };
+
+    let seconds = elapsed.as_secs();
+
+    if seconds < 60 {
+        format!("{}s", seconds)
+    } else if seconds < 3600 {
+        // Under 1 hour: show minutes (rounded)
+        let minutes = (seconds + 30) / 60; // Round to nearest minute
+        format!("{}m", minutes)
+    } else if seconds < 86400 {
+        // Under 1 day: show hours (rounded)
+        let hours = (seconds + 1800) / 3600; // Round to nearest hour
+        format!("{}h", hours)
+    } else if seconds < 2592000 {
+        // Under 30 days: show days (rounded)
+        let days = (seconds + 43200) / 86400; // Round to nearest day
+        format!("{}d", days)
+    } else if seconds < 31536000 {
+        // Under 1 year: show months (rounded)
+        let months = (seconds + 1296000) / 2592000; // Round to nearest month
+        format!("{}mo", months)
+    } else {
+        // Over 1 year: show years (rounded)
+        let years = (seconds + 15768000) / 31536000; // Round to nearest year
+        format!("{}y", years)
+    }
+}
+
+/// Get the last modification time for a repository
+/// For clean repos, use last commit time. For dirty repos, use max of commit time or dirty files.
+pub fn get_repo_modification_time(
+    repo_path: &Path,
+    is_clean: bool,
+) -> Result<std::time::SystemTime> {
+    if is_clean {
+        // For clean repos, get the last commit time
+        get_last_commit_time(repo_path)
+    } else {
+        // For dirty repos, get the max of last commit time and dirty file modification times
+        let commit_time =
+            get_last_commit_time(repo_path).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let dirty_files_time = get_dirty_files_modification_time(repo_path)
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        Ok(commit_time.max(dirty_files_time))
+    }
+}
+
+/// Get the last commit time using git
+fn get_last_commit_time(repo_path: &Path) -> Result<std::time::SystemTime> {
+    use std::process::Command;
+
+    let output = Command::new("git")
+        .args([
+            "-C",
+            repo_path.to_str().unwrap(),
+            "log",
+            "-1",
+            "--format=%ct",
+        ])
+        .output()?;
+
+    if !output.status.success() {
+        bail!("Failed to get last commit time");
+    }
+
+    let timestamp_str = String::from_utf8(output.stdout)?;
+    let timestamp: i64 = timestamp_str.trim().parse()?;
+    let system_time =
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(timestamp as u64);
+
+    Ok(system_time)
+}
+
+/// Get the most recent modification time of dirty files
+fn get_dirty_files_modification_time(repo_path: &Path) -> Result<std::time::SystemTime> {
+    use std::process::Command;
+
+    // Get list of modified/untracked files
+    let output = Command::new("git")
+        .args(["-C", repo_path.to_str().unwrap(), "status", "--porcelain"])
+        .output()?;
+
+    if !output.status.success() {
+        bail!("Failed to get dirty files");
+    }
+
+    let mut latest_time = std::time::SystemTime::UNIX_EPOCH;
+
+    for line in String::from_utf8(output.stdout)?.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+
+        // Extract filename from git status output
+        let filename = line[3..].trim();
+        let file_path = repo_path.join(filename);
+
+        if let Ok(metadata) = std::fs::metadata(&file_path)
+            && let Ok(modified) = metadata.modified()
+            && modified > latest_time
+        {
+            latest_time = modified;
+        }
+    }
+
+    // Return the latest time found (could be UNIX_EPOCH if no files found)
+    Ok(latest_time)
+}
+
 /// A `Workspace` is filesystem directory containing git repositories checked out
 /// from one or more providers. Each repository's path matches the remote's path,
 /// for example:
@@ -304,7 +422,7 @@ impl Workspace {
                 workspace.validate()?;
 
                 // Make sure library directory exists
-                std::fs::create_dir_all(&workspace.library_path_buf())
+                std::fs::create_dir_all(workspace.library_path_buf())
                     .map_err(|e| anyhow::anyhow!("Failed to create library directory: {}", e))?;
 
                 return Ok(Some(workspace));
@@ -390,12 +508,7 @@ impl Workspace {
     }
 
     /// Drop a repository from this workspace
-    pub fn drop(
-        &self,
-        pattern: &RepoPattern,
-        delete: bool,
-        force: bool,
-    ) -> Result<()> {
+    pub fn drop(&self, pattern: &RepoPattern, delete: bool, force: bool) -> Result<()> {
         use tracing::{debug, info, warn};
 
         debug!("Drop requested for pattern: {:?}", pattern);
@@ -645,13 +758,16 @@ impl Workspace {
             let remote_name = remote_name.trim();
             if !remote_name.is_empty() {
                 // Get the URL for this remote from the library
-                if let Ok(remote_url) = run_fun!(git -C $source config --get remote.$remote_name.url) {
+                if let Ok(remote_url) =
+                    run_fun!(git -C $source config --get remote.$remote_name.url)
+                {
                     let remote_url = remote_url.trim();
                     debug!("Restoring remote '{}' to: {}", remote_name, remote_url);
 
                     // Update the remote URL in the restored repository
-                    run_fun!(git -C $dest remote set-url $remote_name $remote_url)
-                        .map_err(|e| anyhow::anyhow!("Failed to restore remote '{}': {}", remote_name, e))?;
+                    run_fun!(git -C $dest remote set-url $remote_name $remote_url).map_err(
+                        |e| anyhow::anyhow!("Failed to restore remote '{}': {}", remote_name, e),
+                    )?;
                 }
             }
         }

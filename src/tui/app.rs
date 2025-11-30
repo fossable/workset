@@ -288,7 +288,11 @@ impl App {
         }
     }
 
-    pub fn update_repo_status(&mut self, display_name: &str, status: super::tree::RepoOperationStatus) {
+    pub fn update_repo_status(
+        &mut self,
+        display_name: &str,
+        status: super::tree::RepoOperationStatus,
+    ) {
         // Update in workspace tree
         update_repo_status_in_tree(&mut self.workspace_tree, display_name, status.clone());
         update_repo_status_in_tree(&mut self.filtered_workspace, display_name, status.clone());
@@ -297,15 +301,18 @@ impl App {
         update_repo_status_in_tree(&mut self.library_tree, display_name, status.clone());
         update_repo_status_in_tree(&mut self.filtered_library, display_name, status);
     }
-
 }
 
-fn update_repo_status_in_tree(nodes: &mut [TreeNode], display_name: &str, status: super::tree::RepoOperationStatus) {
+fn update_repo_status_in_tree(
+    nodes: &mut [TreeNode],
+    display_name: &str,
+    status: super::tree::RepoOperationStatus,
+) {
     for node in nodes {
-        if let Some(ref mut repo) = node.repo_info {
-            if repo.display_name == display_name {
-                repo.operation_status = status.clone();
-            }
+        if let Some(ref mut repo) = node.repo_info
+            && repo.display_name == display_name
+        {
+            repo.operation_status = status.clone();
         }
         update_repo_status_in_tree(&mut node.children, display_name, status.clone());
     }

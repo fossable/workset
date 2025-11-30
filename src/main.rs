@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::io::IsTerminal;
 use tracing::level_filters::LevelFilter;
 use tracing::{error, info};
 use workset::Workspace;
@@ -6,6 +7,16 @@ use workset::Workspace;
 /// Build info provided by built crate.
 pub mod build_info {
     include!(concat!(env!("OUT_DIR"), "/built.rs"));
+}
+
+/// ANSI color codes
+mod colors {
+    pub const RESET: &str = "\x1b[0m";
+    pub const BOLD: &str = "\x1b[1m";
+    pub const CYAN: &str = "\x1b[36m";
+    pub const GREEN: &str = "\x1b[32m";
+    pub const YELLOW: &str = "\x1b[33m";
+    pub const DIM: &str = "\x1b[2m";
 }
 
 fn main() -> Result<()> {
@@ -32,46 +43,77 @@ fn main() -> Result<()> {
 
     let mut args = pico_args::Arguments::from_env();
     if args.contains("--help") {
-        println!(
-            "workset {} ({})",
-            build_info::PKG_VERSION,
-            build_info::BUILT_TIME_UTC
+        let is_tty = std::io::stdout().is_terminal();
+
+        let help = format!(
+            r#"{workset} {version} ({built})
+
+{desc_header}
+  Manage git repos with working sets.
+
+{usage_header}
+  {cmd}workset{reset} init
+  {cmd}workset{reset} <repo pattern>
+  {cmd}workset{reset} drop [repo pattern] [--delete] [--force]
+
+{commands_header}
+  {subcmd}init{reset}                                 Initialize a workspace in current directory
+  {subcmd}<pattern>{reset}                            Add a repository to your working set
+  {subcmd}drop{reset} {arg}[pattern]{reset} {arg}[--delete]{reset} {arg}[--force]{reset}  Drop repository(ies) from workspace
+{dim}                                       Without pattern: drops all in current directory
+                                       With --delete: permanently delete (don't store)
+                                       With --force: drop even with uncommitted changes{reset}
+  {subcmd}list{reset}, {subcmd}ls{reset}                             List all repositories with their status
+  {subcmd}status{reset}                               Show workspace summary and statistics
+
+{examples_header}
+  {cmd}workset init{reset}                              Initialize workspace here
+  {cmd}workset github.com/user/repo{reset}              Add a repository
+  {cmd}workset repo{reset}                              Restore 'repo' from library
+  {cmd}workset drop ./repo{reset}                       Drop repo (save to library)
+  {cmd}workset drop{reset}                              Drop all repos in current dir
+  {cmd}workset drop --delete ./old_repo{reset}          Permanently delete a repo
+  {cmd}workset drop --force ./dirty_repo{reset}         Force drop repo with changes
+"#,
+            workset = if is_tty {
+                format!("{}{}{}", colors::BOLD, "workset", colors::RESET)
+            } else {
+                "workset".to_string()
+            },
+            version = if is_tty {
+                format!("{}{}{}", colors::CYAN, build_info::PKG_VERSION, colors::RESET)
+            } else {
+                build_info::PKG_VERSION.to_string()
+            },
+            built = build_info::BUILT_TIME_UTC,
+            desc_header = if is_tty {
+                format!("{}{}{}", colors::BOLD, "DESCRIPTION:", colors::RESET)
+            } else {
+                "DESCRIPTION:".to_string()
+            },
+            usage_header = if is_tty {
+                format!("{}{}{}", colors::BOLD, "USAGE:", colors::RESET)
+            } else {
+                "USAGE:".to_string()
+            },
+            commands_header = if is_tty {
+                format!("{}{}{}", colors::BOLD, "COMMANDS:", colors::RESET)
+            } else {
+                "COMMANDS:".to_string()
+            },
+            examples_header = if is_tty {
+                format!("{}{}{}", colors::BOLD, "EXAMPLES:", colors::RESET)
+            } else {
+                "EXAMPLES:".to_string()
+            },
+            cmd = if is_tty { colors::GREEN } else { "" },
+            subcmd = if is_tty { colors::CYAN } else { "" },
+            arg = if is_tty { colors::YELLOW } else { "" },
+            dim = if is_tty { colors::DIM } else { "" },
+            reset = if is_tty { colors::RESET } else { "" },
         );
-        println!();
-        println!("DESCRIPTION:");
-        println!("  Manage git repos with working sets.");
-        println!();
-        println!("USAGE:");
-        println!("  workset init");
-        println!("  workset <repo pattern>");
-        println!("  workset drop [repo pattern] [--delete] [--force]");
-        println!();
-        println!("COMMANDS:");
-        println!(
-            "  init                                 Initialize a workspace in current directory"
-        );
-        println!("  <pattern>                            Add a repository to your working set");
-        println!("  drop [pattern] [--delete] [--force]  Drop repository(ies) from workspace");
-        println!(
-            "                                       Without pattern: drops all in current directory"
-        );
-        println!(
-            "                                       With --delete: permanently delete (don't store)"
-        );
-        println!(
-            "                                       With --force: drop even with uncommitted changes"
-        );
-        println!("  list, ls                             List all repositories with their status");
-        println!("  status                               Show workspace summary and statistics");
-        println!();
-        println!("EXAMPLES:");
-        println!("  workset init                              Initialize workspace here");
-        println!("  workset github.com/user/repo              Add a repository");
-        println!("  workset repo                              Restore 'repo' from library");
-        println!("  workset drop ./repo                       Drop repo (save to library)");
-        println!("  workset drop                              Drop all repos in current dir");
-        println!("  workset drop --delete ./old_repo          Permanently delete a repo");
-        println!("  workset drop --force ./dirty_repo         Force drop repo with changes");
+        print!("{}", help);
+
         return Ok(());
     }
 
@@ -83,7 +125,10 @@ fn main() -> Result<()> {
                 let library_path = workspace_path.join(".workset");
 
                 if library_path.exists() {
-                    info!("✓ Workspace already initialized at {}", workspace_path.display());
+                    info!(
+                        "✓ Workspace already initialized at {}",
+                        workspace_path.display()
+                    );
                 } else {
                     std::fs::create_dir_all(&library_path)?;
                     info!("✓ Initialized workspace at {}", workspace_path.display());
@@ -247,6 +292,59 @@ fn get_repo_completions(workspace: &Workspace) -> Vec<String> {
     repos
 }
 
+/// Get repository completions with metadata (status and modification time) for fish shell
+fn get_repo_completions_with_metadata(workspace: &Workspace) -> Vec<(String, String)> {
+    let mut repos = Vec::new();
+
+    // Only complete with local workspace repos
+    if let Ok(local_repos) = workset::find_git_repositories(&workspace.path) {
+        for repo in local_repos {
+            if let Ok(relative) = repo.strip_prefix(&workspace.path) {
+                let repo_name = relative.display().to_string();
+
+                // Get repo status and modification time
+                // If these fail, we'll still provide a basic completion
+                let status = workset::check_repo_status(&repo).ok();
+                let is_clean = matches!(status, Some(workset::RepoStatus::Clean));
+                let mod_time = workset::get_repo_modification_time(&repo, is_clean).ok();
+
+                // Build description with status and time
+                let mut desc_parts = Vec::new();
+
+                // Add status indicator
+                match status {
+                    Some(workset::RepoStatus::Clean) => desc_parts.push("clean".to_string()),
+                    Some(workset::RepoStatus::Dirty) => desc_parts.push("dirty".to_string()),
+                    Some(workset::RepoStatus::Unpushed) => desc_parts.push("unpushed".to_string()),
+                    Some(workset::RepoStatus::NoCommits) => {
+                        desc_parts.push("no commits".to_string())
+                    }
+                    None => {} // Don't add "unknown" if status check failed
+                }
+
+                // Add modification time
+                if let Some(time) = mod_time {
+                    desc_parts.push(workset::format_time_ago(time));
+                }
+
+                // If we couldn't get any metadata, use a default description
+                let description = if desc_parts.is_empty() {
+                    "repository".to_string()
+                } else {
+                    desc_parts.join(", ")
+                };
+
+                repos.push((repo_name, description));
+            }
+        }
+    }
+
+    // Sort by repo name
+    repos.sort_by(|a, b| a.0.cmp(&b.0));
+    repos.dedup();
+    repos
+}
+
 /// Output dynamic completions for bash
 fn complete_bash(maybe_workspace: Option<Workspace>) -> Result<()> {
     let comp_line = std::env::var("COMP_LINE").unwrap_or_default();
@@ -290,9 +388,9 @@ fn complete_fish(maybe_workspace: Option<Workspace>) -> Result<()> {
             println!("init\tInitialize a workspace in current directory");
         }
     } else if let Some(workspace) = maybe_workspace {
-        // Complete repository paths
-        for repo in get_repo_completions(&workspace) {
-            println!("{}", repo);
+        // Complete repository paths with status and modification time
+        for (repo_name, description) in get_repo_completions_with_metadata(&workspace) {
+            println!("{}\t{}", repo_name, description);
         }
     }
 
@@ -302,6 +400,11 @@ fn complete_fish(maybe_workspace: Option<Workspace>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use tempfile::TempDir;
     use workset::Workspace;
 
     #[test]
@@ -313,5 +416,507 @@ mod tests {
         let completions = get_repo_completions(&workspace);
         // Should be empty since the path doesn't exist
         assert_eq!(completions.len(), 0);
+    }
+
+    /// Helper to create a test workspace with some git repos
+    fn setup_test_workspace() -> TempDir {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_path = temp_dir.path();
+
+        // Create .workset directory to mark it as a workspace
+        fs::create_dir(workspace_path.join(".workset")).unwrap();
+
+        // Create some test git repositories with actual git initialization
+        for repo_name in &["repo1", "repo2", "subdir/repo3"] {
+            let repo_path = workspace_path.join(repo_name);
+            fs::create_dir_all(&repo_path).unwrap();
+
+            // Initialize as a real git repository
+            Command::new("git")
+                .args(["init"])
+                .current_dir(&repo_path)
+                .output()
+                .unwrap();
+
+            // Configure git user for commits
+            Command::new("git")
+                .args(["config", "user.email", "test@example.com"])
+                .current_dir(&repo_path)
+                .output()
+                .unwrap();
+            Command::new("git")
+                .args(["config", "user.name", "Test User"])
+                .current_dir(&repo_path)
+                .output()
+                .unwrap();
+
+            // Create an initial commit
+            fs::write(repo_path.join("README.md"), "# Test repo\n").unwrap();
+            Command::new("git")
+                .args(["add", "README.md"])
+                .current_dir(&repo_path)
+                .output()
+                .unwrap();
+            Command::new("git")
+                .args(["commit", "-m", "Initial commit"])
+                .current_dir(&repo_path)
+                .output()
+                .unwrap();
+        }
+
+        temp_dir
+    }
+
+    /// Get the path to the compiled binary
+    fn get_binary_path() -> PathBuf {
+        // Look for the binary in target/debug or target/release
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let debug_path = PathBuf::from(manifest_dir).join("target/debug/workset");
+        let release_path = PathBuf::from(manifest_dir).join("target/release/workset");
+
+        if release_path.exists() {
+            release_path
+        } else if debug_path.exists() {
+            debug_path
+        } else {
+            panic!("Binary not found. Run 'cargo build' first.");
+        }
+    }
+
+    #[test]
+    fn test_bash_complete_init_without_workspace() {
+        let binary = get_binary_path();
+        let temp_dir = TempDir::new().unwrap();
+
+        // Bash sets these environment variables when tab completion is triggered
+        let output = Command::new(&binary)
+            .env("_ARGCOMPLETE_", "bash")
+            .env("COMP_LINE", "workset ")
+            .env("COMP_POINT", "8") // Position after "workset "
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to execute binary");
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output.status.success(),
+            "Command failed with stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // When not in a workspace, should only suggest "init"
+        assert_eq!(stdout.trim(), "init");
+    }
+
+    #[test]
+    fn test_bash_complete_drop_with_workspace() {
+        let temp_dir = setup_test_workspace();
+        let binary = get_binary_path();
+
+        // Bash completion after "workset " in a workspace
+        let output = Command::new(&binary)
+            .env("_ARGCOMPLETE_", "bash")
+            .env("COMP_LINE", "workset ")
+            .env("COMP_POINT", "8")
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to execute binary");
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success());
+
+        // In a workspace, should suggest "drop"
+        assert_eq!(stdout.trim(), "drop");
+    }
+
+    #[test]
+    fn test_bash_complete_repo_paths() {
+        let temp_dir = setup_test_workspace();
+        let binary = get_binary_path();
+
+        // Bash completion after "workset drop "
+        let output = Command::new(&binary)
+            .env("_ARGCOMPLETE_", "bash")
+            .env("COMP_LINE", "workset drop ")
+            .env("COMP_POINT", "13") // Position after "workset drop "
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to execute binary");
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success());
+
+        // Should list all repositories in the workspace
+        let completions: Vec<&str> = stdout.trim().split('\n').collect();
+        assert!(completions.contains(&"repo1"));
+        assert!(completions.contains(&"repo2"));
+        assert!(completions.contains(&"subdir/repo3"));
+    }
+
+    #[test]
+    fn test_bash_complete_with_cursor_in_middle() {
+        let temp_dir = setup_test_workspace();
+        let binary = get_binary_path();
+
+        // Bash sets COMP_POINT to cursor position, not necessarily end of line
+        // Simulate: "workset dr|op" where | is cursor
+        // When cursor is at position 10, the current_line is "workset dr"
+        // which splits into ["workset", "dr"], so words.len() == 2
+        let output = Command::new(&binary)
+            .env("_ARGCOMPLETE_", "bash")
+            .env("COMP_LINE", "workset drop")
+            .env("COMP_POINT", "10") // Cursor after "workset dr"
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to execute binary");
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success());
+
+        // With 2 words in the current line, it completes repository paths
+        let completions: Vec<&str> = stdout.trim().split('\n').collect();
+        assert!(completions.contains(&"repo1"));
+        assert!(completions.contains(&"repo2"));
+        assert!(completions.contains(&"subdir/repo3"));
+    }
+
+    #[test]
+    fn test_fish_complete_init_without_workspace() {
+        let binary = get_binary_path();
+        let temp_dir = TempDir::new().unwrap();
+
+        // Fish sets COMP_LINE environment variable
+        let output = Command::new(&binary)
+            .env("_ARGCOMPLETE_", "fish")
+            .env("COMP_LINE", "workset ")
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to execute binary");
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success());
+
+        // Fish format includes tab-separated description
+        assert_eq!(
+            stdout.trim(),
+            "init\tInitialize a workspace in current directory"
+        );
+    }
+
+    #[test]
+    fn test_fish_complete_drop_with_workspace() {
+        let temp_dir = setup_test_workspace();
+        let binary = get_binary_path();
+
+        // Fish completion after "workset "
+        let output = Command::new(&binary)
+            .env("_ARGCOMPLETE_", "fish")
+            .env("COMP_LINE", "workset ")
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to execute binary");
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success());
+
+        // In a workspace, should suggest "drop" with description
+        assert_eq!(stdout.trim(), "drop\tDrop one or more repositories");
+    }
+
+    #[test]
+    fn test_fish_complete_repo_paths() {
+        let temp_dir = setup_test_workspace();
+        let binary = get_binary_path();
+
+        // Fish completion after "workset drop "
+        let output = Command::new(&binary)
+            .env("_ARGCOMPLETE_", "fish")
+            .env("COMP_LINE", "workset drop ")
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to execute binary");
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success());
+
+        // Debug: print actual output
+        eprintln!("Fish completion output:\n{}", stdout);
+
+        // Should list all repositories with status and modification time
+        let lines: Vec<&str> = stdout.trim().split('\n').collect();
+        assert_eq!(lines.len(), 3, "Expected 3 repos, got:\n{}", stdout);
+
+        // Each line should have format: "repo_name\tstatus, time"
+        for line in &lines {
+            assert!(
+                line.contains('\t'),
+                "Line should contain tab separator: {}\nFull output:\n{}",
+                line,
+                stdout
+            );
+            let parts: Vec<&str> = line.split('\t').collect();
+            assert_eq!(parts.len(), 2, "Line should have repo name and description");
+
+            // Check that we have one of our repos
+            let repo_name = parts[0];
+            assert!(
+                repo_name == "repo1" || repo_name == "repo2" || repo_name == "subdir/repo3",
+                "Unexpected repo: {}",
+                repo_name
+            );
+
+            // Check that description contains status
+            let description = parts[1];
+            assert!(
+                description.contains("clean")
+                    || description.contains("dirty")
+                    || description.contains("unpushed")
+                    || description.contains("no commits"),
+                "Description should contain status: {}",
+                description
+            );
+        }
+    }
+
+    #[test]
+    fn test_fish_complete_partial_command() {
+        let temp_dir = setup_test_workspace();
+        let binary = get_binary_path();
+
+        // Fish completion after "workset dr" (no trailing space)
+        let output = Command::new(&binary)
+            .env("_ARGCOMPLETE_", "fish")
+            .env("COMP_LINE", "workset dr")
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to execute binary");
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success());
+
+        // Should still suggest "drop" command
+        assert_eq!(stdout.trim(), "drop\tDrop one or more repositories");
+    }
+
+    #[test]
+    fn test_unsupported_shell() {
+        let binary = get_binary_path();
+        let temp_dir = TempDir::new().unwrap();
+
+        // Test with unsupported shell type
+        let output = Command::new(&binary)
+            .env("_ARGCOMPLETE_", "zsh")
+            .env("COMP_LINE", "workset ")
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to execute binary");
+
+        // Should fail with unsupported shell error
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("Unsupported shell type"));
+    }
+
+    #[test]
+    fn test_get_repo_completions_with_repos() {
+        let temp_dir = setup_test_workspace();
+        let workspace = Workspace {
+            path: temp_dir.path().to_string_lossy().to_string(),
+        };
+
+        let completions = get_repo_completions(&workspace);
+
+        // Should find all 3 repositories
+        assert_eq!(completions.len(), 3);
+        assert!(completions.contains(&"repo1".to_string()));
+        assert!(completions.contains(&"repo2".to_string()));
+        assert!(completions.contains(&"subdir/repo3".to_string()));
+    }
+
+    #[test]
+    fn test_bash_empty_comp_line() {
+        let binary = get_binary_path();
+        let temp_dir = setup_test_workspace();
+
+        // Empty COMP_LINE (just "workset" with no space)
+        let output = Command::new(&binary)
+            .env("_ARGCOMPLETE_", "bash")
+            .env("COMP_LINE", "workset")
+            .env("COMP_POINT", "7")
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to execute binary");
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success());
+
+        // Should suggest commands
+        assert_eq!(stdout.trim(), "drop");
+    }
+
+    #[test]
+    fn test_fish_empty_comp_line() {
+        let binary = get_binary_path();
+        let temp_dir = setup_test_workspace();
+
+        // Empty COMP_LINE (just "workset" with no space)
+        let output = Command::new(&binary)
+            .env("_ARGCOMPLETE_", "fish")
+            .env("COMP_LINE", "workset")
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to execute binary");
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success());
+
+        // Should suggest commands with description
+        assert_eq!(stdout.trim(), "drop\tDrop one or more repositories");
+    }
+
+    #[test]
+    fn test_bash_complete_with_trailing_spaces() {
+        let temp_dir = setup_test_workspace();
+        let binary = get_binary_path();
+
+        // Multiple spaces after command
+        let output = Command::new(&binary)
+            .env("_ARGCOMPLETE_", "bash")
+            .env("COMP_LINE", "workset   ")
+            .env("COMP_POINT", "10") // After multiple spaces
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to execute binary");
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success());
+
+        // Should still suggest "drop"
+        assert_eq!(stdout.trim(), "drop");
+    }
+
+    #[test]
+    fn test_bash_complete_list_command() {
+        let temp_dir = setup_test_workspace();
+        let binary = get_binary_path();
+
+        // Bash completion after "workset l" - testing command prefix matching
+        let output = Command::new(&binary)
+            .env("_ARGCOMPLETE_", "bash")
+            .env("COMP_LINE", "workset l")
+            .env("COMP_POINT", "9")
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to execute binary");
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success());
+
+        // With 2 words, completes repos (not subcommands)
+        let completions: Vec<&str> = stdout.trim().split('\n').collect();
+        assert!(completions.contains(&"repo1"));
+    }
+
+    #[test]
+    fn test_fish_complete_with_multiple_args() {
+        let temp_dir = setup_test_workspace();
+        let binary = get_binary_path();
+
+        // Fish completion after "workset drop repo1 "
+        // Testing that it continues offering completions
+        let output = Command::new(&binary)
+            .env("_ARGCOMPLETE_", "fish")
+            .env("COMP_LINE", "workset drop repo1 ")
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to execute binary");
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success());
+
+        // Should still list repositories (for multiple drops) with metadata
+        let lines: Vec<&str> = stdout.trim().split('\n').collect();
+        assert_eq!(lines.len(), 3);
+
+        // Check that all repos are present (now with tab-separated descriptions)
+        let repo_names: Vec<&str> = lines
+            .iter()
+            .map(|line| line.split('\t').next().unwrap())
+            .collect();
+        assert!(repo_names.contains(&"repo1"));
+        assert!(repo_names.contains(&"repo2"));
+        assert!(repo_names.contains(&"subdir/repo3"));
+    }
+
+    #[test]
+    fn test_bash_no_comp_point() {
+        let binary = get_binary_path();
+        let temp_dir = setup_test_workspace();
+
+        // Missing COMP_POINT should default to 0
+        let output = Command::new(&binary)
+            .env("_ARGCOMPLETE_", "bash")
+            .env("COMP_LINE", "workset ")
+            // No COMP_POINT set
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to execute binary");
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success());
+
+        // With COMP_POINT=0, current_line is empty, so words.len() <= 1
+        assert_eq!(stdout.trim(), "drop");
+    }
+
+    #[test]
+    fn test_completions_are_sorted() {
+        let temp_dir = setup_test_workspace();
+        let workspace = Workspace {
+            path: temp_dir.path().to_string_lossy().to_string(),
+        };
+
+        let completions = get_repo_completions(&workspace);
+
+        // Verify completions are sorted (requirement from get_repo_completions)
+        let mut sorted = completions.clone();
+        sorted.sort();
+        assert_eq!(completions, sorted);
+    }
+
+    #[test]
+    fn test_fish_vs_bash_output_format() {
+        let temp_dir = TempDir::new().unwrap();
+        let binary = get_binary_path();
+
+        // Get bash output
+        let bash_output = Command::new(&binary)
+            .env("_ARGCOMPLETE_", "bash")
+            .env("COMP_LINE", "workset ")
+            .env("COMP_POINT", "8")
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to execute binary");
+
+        // Get fish output
+        let fish_output = Command::new(&binary)
+            .env("_ARGCOMPLETE_", "fish")
+            .env("COMP_LINE", "workset ")
+            .current_dir(temp_dir.path())
+            .output()
+            .expect("Failed to execute binary");
+
+        let bash_stdout = String::from_utf8(bash_output.stdout).unwrap();
+        let fish_stdout = String::from_utf8(fish_output.stdout).unwrap();
+
+        // Bash should just have command name
+        assert_eq!(bash_stdout.trim(), "init");
+
+        // Fish should have command name + description separated by tab
+        assert!(fish_stdout.contains('\t'));
+        assert_eq!(
+            fish_stdout.trim(),
+            "init\tInitialize a workspace in current directory"
+        );
     }
 }
