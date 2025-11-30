@@ -141,7 +141,35 @@ pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
             return Ok(RepoStatus::NoCommits);
         }
     };
+    check_repo_status_with_handle(&repo, repo_path)
+}
 
+/// Check repository status and get modification time in a single repo open
+/// This is more efficient than calling check_repo_status and get_repo_modification_time separately
+pub fn check_repo_status_and_modification_time(
+    repo_path: &Path,
+) -> Result<(RepoStatus, Option<std::time::SystemTime>)> {
+    let repo = match gix::open(repo_path) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(
+                "Failed to open repository at {}: {}",
+                repo_path.display(),
+                e
+            );
+            return Ok((RepoStatus::NoCommits, None));
+        }
+    };
+
+    let status = check_repo_status_with_handle(&repo, repo_path)?;
+    let is_clean = matches!(status, RepoStatus::Clean);
+    let mod_time = get_repo_modification_time_with_handle(&repo, repo_path, is_clean).ok();
+
+    Ok((status, mod_time))
+}
+
+/// Check repository status using an already-opened repository handle
+fn check_repo_status_with_handle(repo: &gix::Repository, repo_path: &Path) -> Result<RepoStatus> {
     // Check if repo has commits
     let head_ref = match repo.head() {
         Ok(head) => match head.try_into_referent() {
@@ -151,24 +179,7 @@ pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
         Err(_) => return Ok(RepoStatus::NoCommits),
     };
 
-    // Check for uncommitted changes first (using is_dirty)
-    let is_dirty = match repo.is_dirty() {
-        Ok(dirty) => dirty,
-        Err(e) => {
-            warn!(
-                "Failed to check if repository is dirty at {}: {}",
-                repo_path.display(),
-                e
-            );
-            false
-        }
-    };
-
-    if is_dirty {
-        return Ok(RepoStatus::Dirty);
-    }
-
-    // Also check for untracked files
+    // Check for uncommitted changes using a single status call
     let platform = match repo.status(gix::progress::Discard) {
         Ok(p) => p,
         Err(e) => {
@@ -181,14 +192,15 @@ pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
         }
     };
 
-    let has_untracked = match platform
+    // Check both tracked changes and untracked files in one pass
+    let has_changes = match platform
         .untracked_files(gix::status::UntrackedFiles::Files)
         .into_index_worktree_iter(Vec::new())
     {
         Ok(mut iter) => iter.by_ref().flatten().next().is_some(),
         Err(e) => {
             warn!(
-                "Failed to check for untracked files at {}: {}",
+                "Failed to check for changes at {}: {}",
                 repo_path.display(),
                 e
             );
@@ -196,7 +208,7 @@ pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
         }
     };
 
-    if has_untracked {
+    if has_changes {
         return Ok(RepoStatus::Dirty);
     }
 
@@ -292,39 +304,45 @@ pub fn get_repo_modification_time(
     repo_path: &Path,
     is_clean: bool,
 ) -> Result<std::time::SystemTime> {
+    let repo = gix::open(repo_path)?;
+    get_repo_modification_time_with_handle(&repo, repo_path, is_clean)
+}
+
+/// Get the modification time using an already-opened repository handle
+fn get_repo_modification_time_with_handle(
+    repo: &gix::Repository,
+    repo_path: &Path,
+    is_clean: bool,
+) -> Result<std::time::SystemTime> {
     if is_clean {
         // For clean repos, get the last commit time
-        get_last_commit_time(repo_path)
+        get_last_commit_time(repo)
     } else {
         // For dirty repos, get the max of last commit time and dirty file modification times
-        let commit_time =
-            get_last_commit_time(repo_path).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        let dirty_files_time = get_dirty_files_modification_time(repo_path)
+        let commit_time = get_last_commit_time(repo).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let dirty_files_time = get_dirty_files_modification_time(repo, repo_path)
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
         Ok(commit_time.max(dirty_files_time))
     }
 }
 
-/// Get the last commit time using git
-fn get_last_commit_time(repo_path: &Path) -> Result<std::time::SystemTime> {
-    use std::process::Command;
+/// Get the last commit time using gix
+fn get_last_commit_time(repo: &gix::Repository) -> Result<std::time::SystemTime> {
+    let head_ref = match repo.head() {
+        Ok(head) => match head.try_into_referent() {
+            Some(head_ref) => head_ref,
+            None => bail!("Failed to get head referent"),
+        },
+        Err(e) => bail!("Failed to get head: {}", e),
+    };
 
-    let output = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_str().unwrap(),
-            "log",
-            "-1",
-            "--format=%ct",
-        ])
-        .output()?;
+    let commit = match head_ref.id().object() {
+        Ok(obj) => obj.try_into_commit()?,
+        Err(e) => bail!("Failed to get commit object: {}", e),
+    };
 
-    if !output.status.success() {
-        bail!("Failed to get last commit time");
-    }
-
-    let timestamp_str = String::from_utf8(output.stdout)?;
-    let timestamp: i64 = timestamp_str.trim().parse()?;
+    let commit_time = commit.time()?;
+    let timestamp = commit_time.seconds;
     let system_time =
         std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(timestamp as u64);
 
@@ -332,34 +350,29 @@ fn get_last_commit_time(repo_path: &Path) -> Result<std::time::SystemTime> {
 }
 
 /// Get the most recent modification time of dirty files
-fn get_dirty_files_modification_time(repo_path: &Path) -> Result<std::time::SystemTime> {
-    use std::process::Command;
-
-    // Get list of modified/untracked files
-    let output = Command::new("git")
-        .args(["-C", repo_path.to_str().unwrap(), "status", "--porcelain"])
-        .output()?;
-
-    if !output.status.success() {
-        bail!("Failed to get dirty files");
-    }
-
+fn get_dirty_files_modification_time(
+    repo: &gix::Repository,
+    repo_path: &Path,
+) -> Result<std::time::SystemTime> {
     let mut latest_time = std::time::SystemTime::UNIX_EPOCH;
 
-    for line in String::from_utf8(output.stdout)?.lines() {
-        if line.len() < 4 {
-            continue;
-        }
+    // Use a single status call and configure it to include both tracked changes and untracked files
+    let platform = repo.status(gix::progress::Discard)?;
 
-        // Extract filename from git status output
-        let filename = line[3..].trim();
-        let file_path = repo_path.join(filename);
-
-        if let Ok(metadata) = std::fs::metadata(&file_path)
-            && let Ok(modified) = metadata.modified()
-            && modified > latest_time
-        {
-            latest_time = modified;
+    // Get an iterator that includes both index-worktree changes AND untracked files
+    if let Ok(iter) = platform
+        .untracked_files(gix::status::UntrackedFiles::Files)
+        .into_index_worktree_iter(Vec::new())
+    {
+        for item in iter.flatten() {
+            let rela_path = item.rela_path();
+            let file_path = repo_path.join(gix::path::from_bstr(rela_path));
+            if let Ok(metadata) = std::fs::metadata(&file_path)
+                && let Ok(modified) = metadata.modified()
+                && modified > latest_time
+            {
+                latest_time = modified;
+            }
         }
     }
 
@@ -664,7 +677,19 @@ impl Workspace {
             std::fs::create_dir_all(std::path::Path::new(&dest_path).parent().unwrap())?;
 
             info!("Cloning {} to {}", clone_url, dest_path);
-            run_fun!(git clone $clone_url $dest_path)?;
+
+            // Clone using gix
+            let mut prepare_fetch = gix::clone::PrepareFetch::new(
+                clone_url,
+                std::path::Path::new(&dest_path),
+                gix::create::Kind::WithWorktree,
+                gix::create::Options::default(),
+                gix::open::Options::isolated(),
+            )?;
+            let should_interrupt = std::sync::atomic::AtomicBool::new(false);
+            let (mut prepare_checkout, _) =
+                prepare_fetch.fetch_then_checkout(gix::progress::Discard, &should_interrupt)?;
+            prepare_checkout.main_worktree(gix::progress::Discard, &should_interrupt)?;
 
             return Ok(PathBuf::from(dest_path));
         }
@@ -698,8 +723,35 @@ impl Workspace {
             bail!("Repository .git directory not found: {}", source);
         }
 
-        run_fun!(git -C $source config core.bare true)
-            .map_err(|e| anyhow::anyhow!("Failed to configure repository as bare: {}", e))?;
+        // Set core.bare=true by modifying the config file directly
+        let config_path = std::path::Path::new(&source).join("config");
+        let config_content = std::fs::read_to_string(&config_path)?;
+
+        // Simple approach: check if core.bare already exists and update it, or add it
+        let new_config = if config_content.contains("[core]") {
+            // Replace or add bare = true under [core]
+            if config_content.contains("bare =") || config_content.contains("bare=") {
+                config_content
+                    .lines()
+                    .map(|line| {
+                        if line.trim().starts_with("bare") {
+                            "\tbare = true".to_string()
+                        } else {
+                            line.to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                // Add bare = true after [core]
+                config_content.replacen("[core]", "[core]\n\tbare = true", 1)
+            }
+        } else {
+            // Add [core] section with bare = true
+            format!("{}\n[core]\n\tbare = true\n", config_content)
+        };
+
+        std::fs::write(&config_path, new_config)?;
 
         debug!(source = %source, dest = %dest, "Storing repository in library");
 
@@ -745,32 +797,64 @@ impl Workspace {
                 .map_err(|e| anyhow::anyhow!("Failed to create parent directory: {}", e))?;
         }
 
-        // Get all remotes from the bare repository
-        let remotes_output = run_fun!(git -C $source remote)
-            .map_err(|e| anyhow::anyhow!("Failed to get remotes from library: {}", e))?;
+        // Get all remotes from the bare repository using gix
+        let source_repo = gix::open(&source)?;
+        let names = source_repo.remote_names();
+        let mut remote_names = Vec::new();
+        for name in names.iter() {
+            if let Ok(s) = std::str::from_utf8(name.as_ref()) {
+                remote_names.push(s.to_string());
+            }
+        }
 
-        // Clone from the library
-        run_fun!(git clone $source $dest)
-            .map_err(|e| anyhow::anyhow!("Failed to restore repository from library: {}", e))?;
+        // Clone from the library using gix
+        let mut prepare_fetch = gix::clone::PrepareFetch::new(
+            source.clone(),
+            std::path::Path::new(&dest),
+            gix::create::Kind::WithWorktree,
+            gix::create::Options::default(),
+            gix::open::Options::isolated(),
+        )?;
+        let should_interrupt = std::sync::atomic::AtomicBool::new(false);
+        let (mut prepare_checkout, _) =
+            prepare_fetch.fetch_then_checkout(gix::progress::Discard, &should_interrupt)?;
+        let (_dest_repo, _) =
+            prepare_checkout.main_worktree(gix::progress::Discard, &should_interrupt)?;
 
-        // Restore all original remote URLs
-        for remote_name in remotes_output.lines() {
-            let remote_name = remote_name.trim();
-            if !remote_name.is_empty() {
-                // Get the URL for this remote from the library
-                if let Ok(remote_url) =
-                    run_fun!(git -C $source config --get remote.$remote_name.url)
-                {
-                    let remote_url = remote_url.trim();
+        // Restore all original remote URLs by updating the config file
+        let dest_config_path = std::path::Path::new(&dest).join(".git/config");
+        let mut dest_config_content = std::fs::read_to_string(&dest_config_path)?;
+
+        for remote_name in &remote_names {
+            // Get the URL for this remote from the library
+            if let Ok(remote) = source_repo.find_remote(remote_name.as_str()) {
+                if let Some(url) = remote.url(gix::remote::Direction::Fetch) {
+                    let remote_url = url.to_bstring().to_string();
                     debug!("Restoring remote '{}' to: {}", remote_name, remote_url);
 
-                    // Update the remote URL in the restored repository
-                    run_fun!(git -C $dest remote set-url $remote_name $remote_url).map_err(
-                        |e| anyhow::anyhow!("Failed to restore remote '{}': {}", remote_name, e),
-                    )?;
+                    // Find and update the URL line for this remote
+                    let remote_section = format!("[remote \"{}\"]", remote_name);
+                    if let Some(section_start) = dest_config_content.find(&remote_section) {
+                        // Find the URL line after the section start
+                        if let Some(url_line_start) =
+                            dest_config_content[section_start..].find("url = ")
+                        {
+                            let abs_url_start = section_start + url_line_start;
+                            if let Some(line_end) = dest_config_content[abs_url_start..].find('\n')
+                            {
+                                let abs_line_end = abs_url_start + line_end;
+                                dest_config_content.replace_range(
+                                    abs_url_start..abs_line_end,
+                                    &format!("\turl = {}", remote_url),
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
+
+        std::fs::write(&dest_config_path, dest_config_content)?;
 
         Ok(())
     }

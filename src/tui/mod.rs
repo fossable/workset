@@ -6,7 +6,7 @@ use app::{App, AppMode, Section};
 use metadata::{format_size, format_time_ago_verbose, get_repo_modification_time, get_repo_size};
 use tree::RepoInfo;
 
-use crate::{Workspace, check_repo_status, find_git_repositories};
+use crate::{Workspace, find_git_repositories};
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -14,6 +14,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use fuzzy_matcher::FuzzyMatcher;
+use notify::{Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -22,11 +23,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
-use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event as NotifyEvent};
 use std::io;
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 /// Shared state for capturing log messages
@@ -136,11 +136,15 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
         let mut watcher = RecommendedWatcher::new(
             move |res: Result<NotifyEvent, notify::Error>| {
                 if let Ok(event) = res {
-                    // Ignore events in .git directories and .workset library
+                    // Ignore events if ANY path is in .git or .workset directories
                     let should_ignore = event.paths.iter().any(|path| {
-                        path.components().any(|c| {
-                            c.as_os_str() == ".git" || c.as_os_str() == ".workset"
-                        })
+                        let path_str = path.to_string_lossy();
+
+                        // Ignore .git and .workset directories
+                        path_str.contains("/.git/")
+                            || path_str.contains("/.workset/")
+                            || path_str.ends_with("/.git")
+                            || path_str.ends_with("/.workset")
                     });
 
                     if !should_ignore {
@@ -169,6 +173,11 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
             // Handle the action
             match action {
                 Action::None => {
+                    // Drain any pending events before cleanup to avoid issues
+                    while event::poll(Duration::from_millis(0))? {
+                        let _ = event::read()?;
+                    }
+
                     // Restore terminal before exiting
                     disable_raw_mode()?;
                     execute!(
@@ -394,142 +403,166 @@ fn run_app<B: ratatui::backend::Backend>(
         }
 
         // Use poll with timeout to allow checking for filesystem updates periodically
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-        {
-            match app.mode {
-                AppMode::Normal => match key.code {
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(Action::None);
-                    }
-                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Ctrl+D = drop workspace repo(s) to library
-                        if app.active_section == Section::Workspace
-                            && let Some(node) = app.selected_workspace_node()
-                        {
-                            let repo_paths = node.collect_repo_paths();
-                            if !repo_paths.is_empty() {
-                                return Ok(Action::DropToLibrary(repo_paths));
-                            }
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(key) => match app.mode {
+                    AppMode::Normal => match key.code {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            return Ok(Action::None);
                         }
-                    }
-                    KeyCode::Right => {
-                        // Right arrow = expand node
-                        app.toggle_expand();
-                    }
-                    KeyCode::Left => {
-                        // Left arrow = collapse node
-                        app.toggle_expand();
-                    }
-                    KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Ctrl+A = clone repo dialog
-                        app.mode = AppMode::CloneRepo;
-                        app.clone_repo_input.clear();
-
-                        // Fetch suggestions in background (blocking for now)
-                        let mut suggestions = Vec::new();
-                        suggestions.extend(get_github_suggestions());
-                        suggestions.extend(get_gitlab_suggestions());
-                        suggestions.sort();
-                        suggestions.dedup();
-
-                        // Filter out repos that already exist in workspace or library
-                        let existing_repos: std::collections::HashSet<String> = app
-                            .get_flattened_workspace()
-                            .iter()
-                            .chain(app.get_flattened_library().iter())
-                            .filter_map(|(node, _, _, _)| {
-                                node.repo_info.as_ref().map(|r| r.display_name.clone())
-                            })
-                            .collect();
-
-                        suggestions.retain(|s| {
-                            // Extract the repo name from the suggestion (e.g., "github.com/user/repo" -> "github.com/user/repo")
-                            !existing_repos.contains(s)
-                        });
-
-                        app.clone_repo_suggestions = suggestions;
-
-                        if !app.clone_repo_suggestions.is_empty() {
-                            app.clone_repo_state.select(Some(0));
-                        }
-                    }
-                    KeyCode::Esc => return Ok(Action::None),
-                    KeyCode::Tab => {
-                        // Tab switches between workspace and library
-                        match app.active_section {
-                            Section::Workspace => {
-                                let library_items = app.get_flattened_library();
-                                if !library_items.is_empty() {
-                                    app.workspace_state.select(None);
-                                    app.library_state.select(Some(0));
-                                    app.active_section = Section::Library;
-                                }
-                            }
-                            Section::Library => {
-                                let workspace_items = app.get_flattened_workspace();
-                                if !workspace_items.is_empty() {
-                                    app.library_state.select(None);
-                                    app.workspace_state.select(Some(0));
-                                    app.active_section = Section::Workspace;
+                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            // Ctrl+D = drop workspace repo(s) to library
+                            if app.active_section == Section::Workspace
+                                && let Some(node) = app.selected_workspace_node()
+                            {
+                                let repo_paths = node.collect_repo_paths();
+                                if !repo_paths.is_empty() {
+                                    return Ok(Action::DropToLibrary(repo_paths));
                                 }
                             }
                         }
-                    }
-                    KeyCode::Down => app.next(),
-                    KeyCode::Up => app.previous(),
-                    KeyCode::Enter => {
-                        // Enter on workspace repo = open shell
-                        // Enter on library repo = restore from library
-                        return Ok(match app.active_section {
-                            Section::Workspace => {
-                                if let Some(node) = app.selected_workspace_node() {
-                                    if let Some(repo) = node.repo_info {
-                                        Action::OpenShell(repo.path.clone())
+                        KeyCode::Right => {
+                            // Right arrow = expand node
+                            app.toggle_expand();
+                        }
+                        KeyCode::Left => {
+                            // Left arrow = collapse node
+                            app.toggle_expand();
+                        }
+                        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            // Ctrl+A = clone repo dialog
+                            app.mode = AppMode::CloneRepo;
+                            app.clone_repo_input.clear();
+
+                            // Fetch suggestions in background (blocking for now)
+                            let mut suggestions = Vec::new();
+                            suggestions.extend(get_github_suggestions());
+                            suggestions.extend(get_gitlab_suggestions());
+                            suggestions.sort();
+                            suggestions.dedup();
+
+                            // Filter out repos that already exist in workspace or library
+                            let existing_repos: std::collections::HashSet<String> = app
+                                .get_flattened_workspace()
+                                .iter()
+                                .chain(app.get_flattened_library().iter())
+                                .filter_map(|(node, _, _, _)| {
+                                    node.repo_info.as_ref().map(|r| r.display_name.clone())
+                                })
+                                .collect();
+
+                            suggestions.retain(|s| {
+                                // Extract the repo name from the suggestion (e.g., "github.com/user/repo" -> "github.com/user/repo")
+                                !existing_repos.contains(s)
+                            });
+
+                            app.clone_repo_suggestions = suggestions;
+
+                            if !app.clone_repo_suggestions.is_empty() {
+                                app.clone_repo_state.select(Some(0));
+                            }
+                        }
+                        KeyCode::Esc => {
+                            // Return None to exit - cleanup happens in the outer loop
+                            return Ok(Action::None);
+                        }
+                        KeyCode::Tab => {
+                            // Tab switches between workspace and library
+                            match app.active_section {
+                                Section::Workspace => {
+                                    let library_items = app.get_flattened_library();
+                                    if !library_items.is_empty() {
+                                        app.workspace_state.select(None);
+                                        app.library_state.select(Some(0));
+                                        app.active_section = Section::Library;
+                                    }
+                                }
+                                Section::Library => {
+                                    let workspace_items = app.get_flattened_workspace();
+                                    if !workspace_items.is_empty() {
+                                        app.library_state.select(None);
+                                        app.workspace_state.select(Some(0));
+                                        app.active_section = Section::Workspace;
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Down => app.next(),
+                        KeyCode::Up => app.previous(),
+                        KeyCode::Enter => {
+                            // Enter on workspace repo = open shell
+                            // Enter on library repo = restore from library
+                            return Ok(match app.active_section {
+                                Section::Workspace => {
+                                    if let Some(node) = app.selected_workspace_node() {
+                                        if let Some(repo) = node.repo_info {
+                                            Action::OpenShell(repo.path.clone())
+                                        } else {
+                                            // Just a directory node, toggle expand
+                                            app.toggle_expand();
+                                            Action::None
+                                        }
                                     } else {
-                                        // Just a directory node, toggle expand
-                                        app.toggle_expand();
                                         Action::None
                                     }
-                                } else {
-                                    Action::None
                                 }
-                            }
-                            Section::Library => {
-                                if let Some(node) = app.selected_library_node() {
-                                    let repo_paths = node.collect_repo_paths();
-                                    if !repo_paths.is_empty() {
-                                        Action::RestoreFromLibrary(repo_paths)
+                                Section::Library => {
+                                    if let Some(node) = app.selected_library_node() {
+                                        let repo_paths = node.collect_repo_paths();
+                                        if !repo_paths.is_empty() {
+                                            Action::RestoreFromLibrary(repo_paths)
+                                        } else {
+                                            // Just a directory node, toggle expand
+                                            app.toggle_expand();
+                                            Action::None
+                                        }
                                     } else {
-                                        // Just a directory node, toggle expand
-                                        app.toggle_expand();
                                         Action::None
                                     }
-                                } else {
-                                    Action::None
                                 }
+                            });
+                        }
+                        KeyCode::Char(c) => {
+                            app.search_query.push(c);
+                            app.filter_repos();
+                        }
+                        KeyCode::Backspace => {
+                            app.search_query.pop();
+                            app.filter_repos();
+                        }
+                        _ => {}
+                    },
+                    AppMode::CloneRepo => match key.code {
+                        KeyCode::Esc => {
+                            app.mode = AppMode::Normal;
+                            app.clone_repo_input.clear();
+                        }
+                        KeyCode::Enter => {
+                            // Use selected suggestion or manual input
+                            let repo = if let Some(idx) = app.clone_repo_state.selected() {
+                                // Filter suggestions by current input
+                                let filtered: Vec<_> = app
+                                    .clone_repo_suggestions
+                                    .iter()
+                                    .filter(|s| {
+                                        s.to_lowercase()
+                                            .contains(&app.clone_repo_input.to_lowercase())
+                                    })
+                                    .collect();
+
+                                filtered.get(idx).map(|s| (*s).to_string())
+                            } else {
+                                None
+                            };
+
+                            let repo = repo.unwrap_or_else(|| app.clone_repo_input.clone());
+
+                            if !repo.is_empty() {
+                                app.mode = AppMode::Normal;
+                                return Ok(Action::CloneRepo(repo));
                             }
-                        });
-                    }
-                    KeyCode::Char(c) => {
-                        app.search_query.push(c);
-                        app.filter_repos();
-                    }
-                    KeyCode::Backspace => {
-                        app.search_query.pop();
-                        app.filter_repos();
-                    }
-                    _ => {}
-                },
-                AppMode::CloneRepo => match key.code {
-                    KeyCode::Esc => {
-                        app.mode = AppMode::Normal;
-                        app.clone_repo_input.clear();
-                    }
-                    KeyCode::Enter => {
-                        // Use selected suggestion or manual input
-                        let repo = if let Some(idx) = app.clone_repo_state.selected() {
-                            // Filter suggestions by current input
+                        }
+                        KeyCode::Down => {
                             let filtered: Vec<_> = app
                                 .clone_repo_suggestions
                                 .iter()
@@ -539,65 +572,46 @@ fn run_app<B: ratatui::backend::Backend>(
                                 })
                                 .collect();
 
-                            filtered.get(idx).map(|s| (*s).to_string())
-                        } else {
-                            None
-                        };
-
-                        let repo = repo.unwrap_or_else(|| app.clone_repo_input.clone());
-
-                        if !repo.is_empty() {
-                            app.mode = AppMode::Normal;
-                            return Ok(Action::CloneRepo(repo));
+                            if !filtered.is_empty() {
+                                let next = match app.clone_repo_state.selected() {
+                                    Some(i) if i >= filtered.len() - 1 => 0,
+                                    Some(i) => i + 1,
+                                    None => 0,
+                                };
+                                app.clone_repo_state.select(Some(next));
+                            }
                         }
-                    }
-                    KeyCode::Down => {
-                        let filtered: Vec<_> = app
-                            .clone_repo_suggestions
-                            .iter()
-                            .filter(|s| {
-                                s.to_lowercase()
-                                    .contains(&app.clone_repo_input.to_lowercase())
-                            })
-                            .collect();
+                        KeyCode::Up => {
+                            let filtered: Vec<_> = app
+                                .clone_repo_suggestions
+                                .iter()
+                                .filter(|s| {
+                                    s.to_lowercase()
+                                        .contains(&app.clone_repo_input.to_lowercase())
+                                })
+                                .collect();
 
-                        if !filtered.is_empty() {
-                            let next = match app.clone_repo_state.selected() {
-                                Some(i) if i >= filtered.len() - 1 => 0,
-                                Some(i) => i + 1,
-                                None => 0,
-                            };
-                            app.clone_repo_state.select(Some(next));
+                            if !filtered.is_empty() {
+                                let prev = match app.clone_repo_state.selected() {
+                                    Some(0) => filtered.len() - 1,
+                                    Some(i) => i - 1,
+                                    None => 0,
+                                };
+                                app.clone_repo_state.select(Some(prev));
+                            }
                         }
-                    }
-                    KeyCode::Up => {
-                        let filtered: Vec<_> = app
-                            .clone_repo_suggestions
-                            .iter()
-                            .filter(|s| {
-                                s.to_lowercase()
-                                    .contains(&app.clone_repo_input.to_lowercase())
-                            })
-                            .collect();
-
-                        if !filtered.is_empty() {
-                            let prev = match app.clone_repo_state.selected() {
-                                Some(0) => filtered.len() - 1,
-                                Some(i) => i - 1,
-                                None => 0,
-                            };
-                            app.clone_repo_state.select(Some(prev));
+                        KeyCode::Char(c) => {
+                            app.clone_repo_input.push(c);
+                            app.clone_repo_state.select(Some(0));
                         }
-                    }
-                    KeyCode::Char(c) => {
-                        app.clone_repo_input.push(c);
-                        app.clone_repo_state.select(Some(0));
-                    }
-                    KeyCode::Backspace => {
-                        app.clone_repo_input.pop();
-                    }
-                    _ => {}
+                        KeyCode::Backspace => {
+                            app.clone_repo_input.pop();
+                        }
+                        _ => {}
+                    },
                 },
+                // Ignore other event types (Mouse, Resize, etc.)
+                _ => {}
             }
         }
     }
@@ -1214,13 +1228,12 @@ fn collect_workspace_repos(workspace: &Workspace) -> Vec<RepoInfo> {
                 .trim_start_matches('/')
                 .to_string();
 
-            // Check repo status in a single pass for performance
-            let status = check_repo_status(&path).unwrap_or(crate::RepoStatus::NoCommits);
+            // Check repo status and get modification time in a single repo open for performance
+            let (status, modification_time) = crate::check_repo_status_and_modification_time(&path)
+                .unwrap_or((crate::RepoStatus::NoCommits, None));
+
             // A repo is only clean if it has commits, no changes, and no unpushed commits
             let is_clean = matches!(status, crate::RepoStatus::Clean);
-
-            // Get modification time
-            let modification_time = get_repo_modification_time(&path, is_clean).ok();
 
             // Size not computed for workspace repos to save time
             let size_bytes = None;

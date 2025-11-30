@@ -29,19 +29,34 @@ fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<
         // Check if this is a partial path for mass cloning
         if (provider == "github.com" || provider == "gitlab.com") && !path.contains('/') {
             // This is a user/org pattern like "github.com/user" - use gh/glab to mass clone
-            info!("🔄 Fetching list of repositories from {}/{}...", provider, path);
+            info!(
+                "🔄 Fetching list of repositories from {}/{}...",
+                provider, path
+            );
 
             // Get list of repos using gh/glab
             let output = if provider == "github.com" {
                 Command::new("gh")
-                    .args(["repo", "list", path, "--json", "nameWithOwner", "--limit", "1000"])
+                    .args([
+                        "repo",
+                        "list",
+                        path,
+                        "--json",
+                        "nameWithOwner",
+                        "--limit",
+                        "1000",
+                    ])
                     .output()
-                    .map_err(|e| anyhow::anyhow!("Failed to run 'gh'. Is it installed? Error: {}", e))?
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to run 'gh'. Is it installed? Error: {}", e)
+                    })?
             } else {
                 Command::new("glab")
                     .args(["repo", "list", path, "--page", "1", "--per-page", "100"])
                     .output()
-                    .map_err(|e| anyhow::anyhow!("Failed to run 'glab'. Is it installed? Error: {}", e))?
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to run 'glab'. Is it installed? Error: {}", e)
+                    })?
             };
 
             if !output.status.success() {
@@ -79,9 +94,10 @@ fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<
             let mut skipped = 0;
 
             for repo in repos {
-                let repo_pattern: workset::RepoPattern = format!("{}/{}", provider, repo)
-                    .parse()
-                    .map_err(|e| anyhow::anyhow!("Failed to parse repo pattern: {}", e))?;
+                let repo_pattern: workset::RepoPattern =
+                    format!("{}/{}", provider, repo)
+                        .parse()
+                        .map_err(|e| anyhow::anyhow!("Failed to parse repo pattern: {}", e))?;
 
                 // Check if repo already exists in workspace
                 let repo_path = PathBuf::from(&workspace.path).join(repo_pattern.full_path());
@@ -142,14 +158,21 @@ fn clone_single_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> R
 
         info!("🔄 Cloning {}...", pattern.full_path());
 
-        let output = std::process::Command::new("git")
-            .args(["clone", &clone_url, &dest_path])
-            .output()?;
+        // TODO show progress
+        let mut prepare_fetch = gix::clone::PrepareFetch::new(
+            clone_url,
+            std::path::Path::new(&dest_path),
+            gix::create::Kind::WithWorktree,
+            gix::create::Options::default(),
+            gix::open::Options::isolated(),
+        )?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("Failed to clone: {}", stderr);
-        }
+        let should_interrupt = std::sync::atomic::AtomicBool::new(false);
+        let (mut prepare_checkout, _fetch_outcome) =
+            prepare_fetch.fetch_then_checkout(gix::progress::Discard, &should_interrupt)?;
+
+        let (_repo, _checkout_outcome) =
+            prepare_checkout.main_worktree(gix::progress::Discard, &should_interrupt)?;
 
         info!("✓ Cloned {}", pattern.full_path());
         Ok(())
@@ -190,7 +213,10 @@ fn restore_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Resul
         return Ok(());
     }
 
-    info!("Found {} matching repository(ies) in library", matching_repos.len());
+    info!(
+        "Found {} matching repository(ies) in library",
+        matching_repos.len()
+    );
 
     let mut restored = 0;
     let mut skipped = 0;
@@ -217,7 +243,10 @@ fn restore_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Resul
         }
     }
 
-    info!("✓ Restored {} repository(ies) ({} skipped)", restored, skipped);
+    info!(
+        "✓ Restored {} repository(ies) ({} skipped)",
+        restored, skipped
+    );
     Ok(())
 }
 
@@ -286,7 +315,12 @@ fn main() -> Result<()> {
                 "workset".to_string()
             },
             version = if is_tty {
-                format!("{}{}{}", colors::CYAN, build_info::PKG_VERSION, colors::RESET)
+                format!(
+                    "{}{}{}",
+                    colors::CYAN,
+                    build_info::PKG_VERSION,
+                    colors::RESET
+                )
             } else {
                 build_info::PKG_VERSION.to_string()
             },

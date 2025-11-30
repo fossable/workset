@@ -5,17 +5,7 @@ use tempfile::TempDir;
 
 /// Get the path to the compiled binary
 fn get_binary_path() -> PathBuf {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let debug_path = PathBuf::from(manifest_dir).join("target/debug/workset");
-    let release_path = PathBuf::from(manifest_dir).join("target/release/workset");
-
-    if release_path.exists() {
-        release_path
-    } else if debug_path.exists() {
-        debug_path
-    } else {
-        panic!("Binary not found. Run 'cargo build' first.");
-    }
+    PathBuf::from(env!("CARGO_BIN_EXE_workset"))
 }
 
 /// Helper to create a git repository with some commits
@@ -678,7 +668,11 @@ fn test_drop_specific_repo_from_subdirectory() {
 
     assert!(output.status.success());
     assert!(!subdir.join("project").exists());
-    assert!(workspace_path.join(".workset/github.com/user/project").exists());
+    assert!(
+        workspace_path
+            .join(".workset/github.com/user/project")
+            .exists()
+    );
 
     // Restore from workspace root
     Command::new(&binary)
@@ -751,8 +745,10 @@ fn test_list_shows_all_workspace_repos() {
 
     // Currently, list shows all repos regardless of CWD
     // This test documents the current behavior
-    assert!(stdout.contains("root-repo") || stdout.contains("sub-repo1"),
-        "List currently shows all workspace repos regardless of CWD");
+    assert!(
+        stdout.contains("root-repo") || stdout.contains("sub-repo1"),
+        "List currently shows all workspace repos regardless of CWD"
+    );
 }
 
 #[test]
@@ -919,7 +915,9 @@ fn test_commands_outside_workspace() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         // Should show empty or error message
         assert!(
-            stdout.is_empty() || stdout.contains("no repositories") || stdout.contains("not in a workspace"),
+            stdout.is_empty()
+                || stdout.contains("no repositories")
+                || stdout.contains("not in a workspace"),
             "List outside workspace should show empty or error"
         );
     }
@@ -936,7 +934,9 @@ fn test_commands_outside_workspace() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         // Should show error or empty workspace info
         assert!(
-            stdout.contains("not in a workspace") || stdout.contains("Workspace:") || stdout.is_empty(),
+            stdout.contains("not in a workspace")
+                || stdout.contains("Workspace:")
+                || stdout.is_empty(),
             "Status outside workspace should indicate no workspace or show empty state"
         );
     }
@@ -954,8 +954,11 @@ fn test_commands_outside_workspace() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        !output.status.success() || stderr.contains("not in") || stdout.contains("not in") ||
-        stderr.contains("No repositories") || stdout.contains("No repositories"),
+        !output.status.success()
+            || stderr.contains("not in")
+            || stdout.contains("not in")
+            || stderr.contains("No repositories")
+            || stdout.contains("No repositories"),
         "Restore should handle outside workspace gracefully"
     );
 
@@ -1013,5 +1016,9 @@ fn test_drop_with_absolute_paths() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!subdir.join("test-repo").exists());
-    assert!(workspace_path.join(".workset/projects/active/test-repo").exists());
+    assert!(
+        workspace_path
+            .join(".workset/projects/active/test-repo")
+            .exists()
+    );
 }
