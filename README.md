@@ -11,13 +11,15 @@
 
 **workset** is yet another tool for managing your local git repos.
 
-| Glossary        |                                                                                                                                                                                     |
+|                 |                                                                                                                                                                                     |
 | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Workspace**   | Local directory where you clone Git repositories. Initialized with `workset init`.                                                                                                  |
 | **Library**     | Local directory (default: `~/.workset`) where **workset** keeps your repos when they're not in your workspace.                                                                      |
 | **Working Set** | Set of repos in your workspace at any given time.                                                                                                                                   |
 | **Drop**        | Move a repo from your workspace to the library. The repo disappears from your workspace, but remains in the library. Only "clean" repos without uncommitted changes can be dropped. |
 | **Restore**     | Bringing a repos from the library back into your workspace.                                                                                                                         |
+
+![](./.github/assets/main.gif)
 
 ## Quickstart
 
@@ -75,7 +77,8 @@ Don't let Github be the only place you store your repos!
 
 **Workset** makes it easy to keep local copies of all of your repos without
 having to sift through them to find the ones you're currently working on.
-Mirroring repos to other hosting providers is also supported.
+Mirroring repos to other hosting providers will be supported in a future
+release.
 
 ## Installation
 
