@@ -777,10 +777,24 @@ fn ui(f: &mut Frame, app: &mut App) {
 
             // Add status icon for repos only
             if let Some(ref repo) = node.repo_info {
-                if repo.is_clean {
-                    spans.push(Span::styled("✓ ", Style::default().fg(Color::Green)));
+                if repo.is_submodule {
+                    // Submodule indicator
+                    if repo.submodule_initialized {
+                        spans.push(Span::styled("📦 ", Style::default().fg(Color::Magenta)));
+                    } else {
+                        spans.push(Span::styled("📦 ", Style::default().fg(Color::DarkGray)));
+                        spans.push(Span::styled(
+                            "(uninit) ",
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
                 } else {
-                    spans.push(Span::styled("⚠ ", Style::default().fg(Color::Yellow)));
+                    // Regular repo status
+                    if repo.is_clean {
+                        spans.push(Span::styled("✓ ", Style::default().fg(Color::Green)));
+                    } else {
+                        spans.push(Span::styled("⚠ ", Style::default().fg(Color::Yellow)));
+                    }
                 }
             }
 
@@ -1216,38 +1230,66 @@ fn render_highlighted_name<'a>(
 
 /// Collect workspace repositories with metadata
 fn collect_workspace_repos(workspace: &Workspace) -> Vec<RepoInfo> {
-    find_git_repositories(&workspace.path)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|path| {
-            let display_name = path
-                .strip_prefix(&workspace.path)
-                .unwrap_or(&path)
-                .display()
-                .to_string()
-                .trim_start_matches('/')
-                .to_string();
+    let repos = find_git_repositories(&workspace.path).unwrap_or_default();
+    let mut repo_infos = Vec::new();
 
-            // Check repo status and get modification time in a single repo open for performance
-            let (status, modification_time) = crate::check_repo_status_and_modification_time(&path)
-                .unwrap_or((crate::RepoStatus::NoCommits, None));
+    for path in repos {
+        let display_name = path
+            .strip_prefix(&workspace.path)
+            .unwrap_or(&path)
+            .display()
+            .to_string()
+            .trim_start_matches('/')
+            .to_string();
 
-            // A repo is only clean if it has commits, no changes, and no unpushed commits
-            let is_clean = matches!(status, crate::RepoStatus::Clean);
+        // Check repo status and get modification time in a single repo open for performance
+        let (status, modification_time) = crate::check_repo_status_and_modification_time(&path)
+            .unwrap_or((crate::RepoStatus::NoCommits, None));
 
-            // Size not computed for workspace repos to save time
-            let size_bytes = None;
+        // A repo is only clean if it has commits, no changes, and no unpushed commits
+        let is_clean = matches!(status, crate::RepoStatus::Clean);
 
-            RepoInfo {
-                path,
-                display_name,
-                is_clean,
-                modification_time,
-                size_bytes,
-                operation_status: tree::RepoOperationStatus::None,
+        // Size not computed for workspace repos to save time
+        let size_bytes = None;
+
+        // Add the main repository
+        repo_infos.push(RepoInfo {
+            path: path.clone(),
+            display_name: display_name.clone(),
+            is_clean,
+            modification_time,
+            size_bytes,
+            operation_status: tree::RepoOperationStatus::None,
+            is_submodule: false,
+            submodule_initialized: false,
+            parent_repo_path: None,
+        });
+
+        // Find and add submodules
+        if let Ok(submodules) = crate::find_submodules_in_repo(&path) {
+            for submodule in submodules {
+                let submodule_display_name = if display_name.is_empty() {
+                    submodule.path.display().to_string()
+                } else {
+                    format!("{}/{}", display_name, submodule.path.display())
+                };
+
+                repo_infos.push(RepoInfo {
+                    path: path.join(&submodule.path),
+                    display_name: submodule_display_name,
+                    is_clean: true, // Submodule status computed separately
+                    modification_time: None,
+                    size_bytes: None,
+                    operation_status: tree::RepoOperationStatus::None,
+                    is_submodule: true,
+                    submodule_initialized: submodule.initialized,
+                    parent_repo_path: Some(path.clone()),
+                });
             }
-        })
-        .collect()
+        }
+    }
+
+    repo_infos
 }
 
 /// Collect library repositories with metadata
@@ -1270,6 +1312,9 @@ fn collect_library_repos(workspace: &Workspace) -> Vec<RepoInfo> {
                 modification_time,
                 size_bytes,
                 operation_status: tree::RepoOperationStatus::None,
+                is_submodule: false,
+                submodule_initialized: false,
+                parent_repo_path: None,
             }
         })
         .collect()

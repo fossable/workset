@@ -72,6 +72,19 @@ impl RepoPattern {
     }
 }
 
+/// Represents a git submodule within a repository
+#[derive(Debug, Clone)]
+pub struct SubmoduleInfo {
+    /// The submodule name from .gitmodules
+    pub name: String,
+    /// Relative path within parent repo
+    pub path: PathBuf,
+    /// Clone URL
+    pub url: String,
+    /// Whether submodule is checked out
+    pub initialized: bool,
+}
+
 /// Recursively find "top-level" git repositories.
 /// This function will not traverse into .git directories or nested git repositories.
 /// Find all git repositories in the given path
@@ -113,6 +126,86 @@ pub fn find_git_repositories(path: &str) -> Result<Vec<PathBuf>> {
     }
 
     Ok(found)
+}
+
+/// Find all submodules in a git repository by parsing the .gitmodules file
+pub fn find_submodules_in_repo(repo_path: &Path) -> Result<Vec<SubmoduleInfo>> {
+    let gitmodules_path = repo_path.join(".gitmodules");
+
+    // If .gitmodules doesn't exist, return empty vec
+    if !gitmodules_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let content = std::fs::read_to_string(&gitmodules_path)?;
+    let mut submodules = Vec::new();
+
+    // Simple parser for .gitmodules INI format
+    let mut current_name: Option<String> = None;
+    let mut current_path: Option<PathBuf> = None;
+    let mut current_url: Option<String> = None;
+
+    for line in content.lines() {
+        let line = line.trim();
+
+        // Skip empty lines and comments
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+
+        // Parse [submodule "name"] section headers
+        if line.starts_with('[') && line.ends_with(']') {
+            // Save previous submodule if we have all required fields
+            if let (Some(name), Some(path), Some(url)) =
+                (current_name.take(), current_path.take(), current_url.take())
+            {
+                // Check if submodule is initialized
+                let initialized = repo_path.join(&path).join(".git").exists();
+
+                submodules.push(SubmoduleInfo {
+                    name: name.clone(),
+                    path,
+                    url,
+                    initialized,
+                });
+            }
+
+            // Extract submodule name from [submodule "name"]
+            if let Some(start) = line.find('"')
+                && let Some(end) = line.rfind('"')
+                && start < end
+            {
+                current_name = Some(line[start + 1..end].to_string());
+            }
+            continue;
+        }
+
+        // Parse key = value lines
+        if let Some(eq_pos) = line.find('=') {
+            let key = line[..eq_pos].trim();
+            let value = line[eq_pos + 1..].trim();
+
+            match key {
+                "path" => current_path = Some(PathBuf::from(value)),
+                "url" => current_url = Some(value.to_string()),
+                _ => {} // Ignore other fields
+            }
+        }
+    }
+
+    // Don't forget the last submodule
+    if let (Some(name), Some(path), Some(url)) = (current_name, current_path, current_url) {
+        let initialized = repo_path.join(&path).join(".git").exists();
+
+        submodules.push(SubmoduleInfo {
+            name,
+            path,
+            url,
+            initialized,
+        });
+    }
+
+    Ok(submodules)
 }
 
 /// Repository status information

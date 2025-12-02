@@ -39,6 +39,12 @@ pub struct RepoInfo {
     pub size_bytes: Option<u64>,
     /// Current operation status
     pub operation_status: RepoOperationStatus,
+    /// Whether this repo is a submodule
+    pub is_submodule: bool,
+    /// Whether this submodule is initialized (checked out)
+    pub submodule_initialized: bool,
+    /// Path to parent repository (for submodules)
+    pub parent_repo_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -75,6 +81,30 @@ impl TreeNode {
             repo_info: None,
             children: Vec::new(),
             expanded: true,
+        }
+    }
+
+    pub fn new_submodule(
+        name: String,
+        parent_path: PathBuf,
+        submodule_path: PathBuf,
+        initialized: bool,
+    ) -> Self {
+        Self {
+            name,
+            repo_info: Some(RepoInfo {
+                path: parent_path.join(&submodule_path),
+                display_name: submodule_path.display().to_string(),
+                is_clean: true, // Submodule status computed separately
+                modification_time: None,
+                size_bytes: None,
+                operation_status: RepoOperationStatus::None,
+                is_submodule: true,
+                submodule_initialized: initialized,
+                parent_repo_path: Some(parent_path),
+            }),
+            children: Vec::new(),
+            expanded: false, // Submodules start collapsed
         }
     }
 
@@ -142,8 +172,13 @@ impl TreeNode {
 
 /// Build a tree structure from a flat list of repos
 pub fn build_tree(mut repos: Vec<RepoInfo>) -> Vec<TreeNode> {
-    // Sort repos by modification time (most recent first)
-    repos.sort_by(|a, b| {
+    // Separate regular repos from submodules
+    let (submodules, regular_repos): (Vec<_>, Vec<_>) =
+        repos.drain(..).partition(|r| r.is_submodule);
+
+    // Sort regular repos by modification time (most recent first)
+    let mut sorted_repos = regular_repos;
+    sorted_repos.sort_by(|a, b| {
         match (a.modification_time, b.modification_time) {
             (Some(a_time), Some(b_time)) => b_time.cmp(&a_time), // Most recent first
             (Some(_), None) => std::cmp::Ordering::Less,         // Items with time come first
@@ -154,7 +189,8 @@ pub fn build_tree(mut repos: Vec<RepoInfo>) -> Vec<TreeNode> {
 
     let mut root_nodes: Vec<TreeNode> = Vec::new();
 
-    for repo in repos {
+    // Build tree from regular repos
+    for repo in sorted_repos {
         let parts: Vec<&str> = repo.display_name.split('/').collect();
 
         if parts.is_empty() {
@@ -189,7 +225,66 @@ pub fn build_tree(mut repos: Vec<RepoInfo>) -> Vec<TreeNode> {
         }
     }
 
+    // Now insert submodules as children of their parent repos
+    for submodule in submodules {
+        insert_submodule_into_tree(&mut root_nodes, submodule);
+    }
+
     root_nodes
+}
+
+/// Helper function to insert a submodule into the tree as a child of its parent repo
+fn insert_submodule_into_tree(root_nodes: &mut Vec<TreeNode>, submodule: RepoInfo) {
+    let parent_path = match &submodule.parent_repo_path {
+        Some(path) => path,
+        None => return, // Shouldn't happen, but skip if no parent
+    };
+
+    // Find the parent repo node
+    if let Some(parent_node) = find_repo_node_by_path(root_nodes, parent_path) {
+        // Create submodule node
+        let submodule_name = submodule
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&submodule.display_name)
+            .to_string();
+
+        let submodule_node = TreeNode::new_submodule(
+            submodule_name,
+            parent_path.clone(),
+            submodule
+                .path
+                .strip_prefix(parent_path)
+                .unwrap_or(&submodule.path)
+                .to_path_buf(),
+            submodule.submodule_initialized,
+        );
+
+        // Add as child of parent
+        parent_node.children.push(submodule_node);
+    }
+}
+
+/// Recursively find a tree node by its repository path
+fn find_repo_node_by_path<'a>(
+    nodes: &'a mut Vec<TreeNode>,
+    path: &PathBuf,
+) -> Option<&'a mut TreeNode> {
+    for node in nodes {
+        // Check if this node matches
+        if let Some(ref repo_info) = node.repo_info
+            && &repo_info.path == path
+        {
+            return Some(node);
+        }
+
+        // Recursively check children
+        if let Some(found) = find_repo_node_by_path(&mut node.children, path) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// Build library tree, excluding repos that exist in workspace
