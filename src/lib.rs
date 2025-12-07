@@ -1,5 +1,4 @@
 use anyhow::{Result, bail};
-use cmd_lib::run_fun;
 use std::error::Error;
 use std::path::Path;
 use std::path::PathBuf;
@@ -861,7 +860,8 @@ impl Workspace {
                 .map_err(|e| anyhow::anyhow!("Failed to remove existing library entry: {}", e))?;
         }
 
-        run_fun!(mv $source $dest)
+        // Move the repository to the library
+        std::fs::rename(&source, &dest)
             .map_err(|e| anyhow::anyhow!("Failed to move repository to library: {}", e))?;
 
         Ok(())

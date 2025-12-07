@@ -1320,6 +1320,25 @@ fn collect_library_repos(workspace: &Workspace) -> Vec<RepoInfo> {
         .collect()
 }
 
+/// Get the configured GitHub hostname from gh CLI
+fn get_github_hostname() -> String {
+    if let Ok(output) = std::process::Command::new("gh")
+        .args(["auth", "status", "--active", "--json", "hosts"])
+        .output()
+        && output.status.success()
+    {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+            if let Some(hosts) = json.get("hosts").and_then(|h| h.as_object()) {
+                if let Some(hostname) = hosts.keys().next() {
+                    return hostname.clone();
+                }
+            }
+        }
+    }
+    // Default to github.com if we can't determine the hostname
+    "github.com".to_string()
+}
+
 /// Fetch repository suggestions from GitHub CLI for TUI autocomplete
 fn get_github_suggestions() -> Vec<String> {
     if let Ok(output) = std::process::Command::new("gh")
@@ -1336,12 +1355,29 @@ fn get_github_suggestions() -> Vec<String> {
         .output()
         && output.status.success()
     {
+        let hostname = get_github_hostname();
         return String::from_utf8_lossy(&output.stdout)
             .lines()
-            .map(|line| format!("github.com/{}", line.trim()))
+            .map(|line| format!("{}/{}", hostname, line.trim()))
             .collect();
     }
     Vec::new()
+}
+
+/// Get the configured GitLab hostname from glab CLI
+fn get_gitlab_hostname() -> String {
+    if let Ok(output) = std::process::Command::new("glab")
+        .args(["config", "get", "host"])
+        .output()
+        && output.status.success()
+    {
+        let hostname = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !hostname.is_empty() {
+            return hostname;
+        }
+    }
+    // Default to gitlab.com if we can't determine the hostname
+    "gitlab.com".to_string()
 }
 
 /// Fetch repository suggestions from GitLab CLI for TUI autocomplete
@@ -1351,12 +1387,13 @@ fn get_gitlab_suggestions() -> Vec<String> {
         .output()
         && output.status.success()
     {
+        let hostname = get_gitlab_hostname();
         return String::from_utf8_lossy(&output.stdout)
             .lines()
             .filter_map(|line| {
                 // glab output format is: "namespace/project"
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                parts.first().map(|repo| format!("gitlab.com/{}", repo))
+                parts.first().map(|repo| format!("{}/{}", hostname, repo))
             })
             .collect();
     }
