@@ -94,3 +94,13 @@ cargo install workset
 ```
 
 </details>
+
+<details>
+<summary>Nixpkgs</summary>
+
+#### Install from nixpkgs
+
+[Nixpkgs](https://search.nixos.org/packages?channel=unstable&query=workset):
+`nix-env -i workset`
+
+</details>
