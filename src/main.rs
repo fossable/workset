@@ -30,8 +30,9 @@ fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<
         if (provider == "github.com" || provider == "gitlab.com") && !path.contains('/') {
             // This is a user/org pattern like "github.com/user" - use gh/glab to mass clone
             info!(
-                "🔄 Fetching list of repositories from {}/{}...",
-                provider, path
+                provider = %provider,
+                path = %path,
+                "Fetching list of repositories"
             );
 
             // Get list of repos using gh/glab
@@ -84,11 +85,11 @@ fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<
             };
 
             if repos.is_empty() {
-                info!("No repositories found for {}/{}", provider, path);
+                info!(provider = %provider, path = %path, "No repositories found");
                 return Ok(());
             }
 
-            info!("Found {} repositories. Cloning...", repos.len());
+            info!(count = repos.len(), "Found repositories, starting clone");
 
             let mut cloned = 0;
             let mut skipped = 0;
@@ -102,7 +103,6 @@ fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<
                 // Check if repo already exists in workspace
                 let repo_path = PathBuf::from(&workspace.path).join(repo_pattern.full_path());
                 if repo_path.exists() {
-                    info!("⊘ Skipping {} (already exists)", repo_pattern.full_path());
                     skipped += 1;
                     continue;
                 }
@@ -113,12 +113,12 @@ fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<
                         cloned += 1;
                     }
                     Err(e) => {
-                        error!("✗ Failed to clone {}: {}", repo_pattern.full_path(), e);
+                        error!(repo = %repo_pattern.full_path(), error = %e, "Failed to clone repository");
                     }
                 }
             }
 
-            info!("✓ Cloned {} repositories ({} skipped)", cloned, skipped);
+            info!(cloned = cloned, skipped = skipped, "Completed cloning repositories");
             return Ok(());
         }
     }
@@ -136,13 +136,13 @@ fn clone_single_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> R
 
     // Check if repo already exists in workspace
     if repo_path.exists() {
-        info!("✓ Repository already exists: {}", pattern.full_path());
+        info!(repo = %pattern.full_path(), "Repository already exists");
         return Ok(());
     }
 
     // Check if it exists in library first
     if workspace.library_contains(&pattern.full_path()) {
-        info!("📦 Repository found in library, use 'restore' instead");
+        info!(repo = %pattern.full_path(), "Repository found in library, use 'restore' instead");
         return Ok(());
     }
 
@@ -156,7 +156,7 @@ fn clone_single_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> R
             std::fs::create_dir_all(parent)?;
         }
 
-        info!("🔄 Cloning {}...", pattern.full_path());
+        info!(repo = %pattern.full_path(), "Cloning repository");
 
         // TODO show progress
         let mut prepare_fetch = gix::clone::PrepareFetch::new(
@@ -174,7 +174,7 @@ fn clone_single_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> R
         let (_repo, _checkout_outcome) =
             prepare_checkout.main_worktree(gix::progress::Discard, &should_interrupt)?;
 
-        info!("✓ Cloned {}", pattern.full_path());
+        info!(repo = %pattern.full_path(), "Successfully cloned repository");
         Ok(())
     } else {
         anyhow::bail!("No provider specified. Use format like github.com/user/repo");
@@ -202,21 +202,11 @@ fn restore_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Resul
         .collect();
 
     if matching_repos.is_empty() {
-        info!("No repositories found in library matching: {}", pattern_str);
-        info!("Available repositories in library:");
-        for repo in library_repos.iter().take(10) {
-            info!("  - {}", repo);
-        }
-        if library_repos.len() > 10 {
-            info!("  ... and {} more", library_repos.len() - 10);
-        }
+        info!(pattern = %pattern_str, "No repositories found in library matching pattern");
         return Ok(());
     }
 
-    info!(
-        "Found {} matching repository(ies) in library",
-        matching_repos.len()
-    );
+    info!(count = matching_repos.len(), "Found matching repositories in library");
 
     let mut restored = 0;
     let mut skipped = 0;
@@ -225,28 +215,22 @@ fn restore_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Resul
         // Check if already exists in workspace
         let dest_path = PathBuf::from(&workspace.path).join(&repo_path);
         if dest_path.exists() {
-            info!("⊘ Skipping {} (already in workspace)", repo_path);
             skipped += 1;
             continue;
         }
 
         // Restore from library
-        info!("📦 Restoring {}...", repo_path);
         match workspace.restore_from_library(&repo_path) {
             Ok(_) => {
-                info!("✓ Restored {}", repo_path);
                 restored += 1;
             }
             Err(e) => {
-                error!("✗ Failed to restore {}: {}", repo_path, e);
+                error!(repo = %repo_path, error = %e, "Failed to restore repository");
             }
         }
     }
 
-    info!(
-        "✓ Restored {} repository(ies) ({} skipped)",
-        restored, skipped
-    );
+    info!(restored = restored, skipped = skipped, "Completed restoring repositories");
     Ok(())
 }
 
@@ -366,13 +350,12 @@ fn main() -> Result<()> {
 
                 if library_path.exists() {
                     info!(
-                        "✓ Workspace already initialized at {}",
-                        workspace_path.display()
+                        path = %workspace_path.display(),
+                        "Workspace already initialized"
                     );
                 } else {
                     std::fs::create_dir_all(&library_path)?;
-                    info!("✓ Initialized workspace at {}", workspace_path.display());
-                    info!("  Library: {}", library_path.display());
+                    info!(path = %workspace_path.display(), "Initialized workspace");
                 }
             }
             "clone" => {
@@ -387,7 +370,7 @@ fn main() -> Result<()> {
                         error!("Usage: workset clone <pattern>");
                     }
                 } else {
-                    error!("You're not in a workspace");
+                    error!("Not in a workspace");
                 }
             }
             "restore" => {
@@ -402,7 +385,7 @@ fn main() -> Result<()> {
                         error!("Usage: workset restore <pattern>");
                     }
                 } else {
-                    error!("You're not in a workspace");
+                    error!("Not in a workspace");
                 }
             }
             "drop" => {
@@ -420,25 +403,25 @@ fn main() -> Result<()> {
                         workspace.drop_all(delete, force)?;
                     }
                 } else {
-                    error!("You're not in a workspace");
+                    error!("Not in a workspace");
                 }
             }
             "list" | "ls" => {
                 if let Some(workspace) = maybe_workspace {
                     list_workspace_status(&workspace)?;
                 } else {
-                    error!("You're not in a workspace");
+                    error!("Not in a workspace");
                 }
             }
             "status" => {
                 if let Some(workspace) = maybe_workspace {
                     show_workspace_summary(&workspace)?;
                 } else {
-                    error!("You're not in a workspace");
+                    error!("Not in a workspace");
                 }
             }
             _ => {
-                error!("Unknown command: {}", command);
+                error!(command = %command, "Unknown command");
                 error!("Run 'workset --help' for usage information");
             }
         },
@@ -449,7 +432,7 @@ fn main() -> Result<()> {
                     // Open TUI for interactive workspace management
                     workset::tui::run_tui(&workspace)?;
                 } else {
-                    error!("You're not in a workspace");
+                    error!("Not in a workspace");
                 }
             }
             #[cfg(not(feature = "tui"))]

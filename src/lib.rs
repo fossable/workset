@@ -117,7 +117,7 @@ pub fn find_git_repositories(path: &str) -> Result<Vec<PathBuf>> {
                     Ok(mut repos) => found.append(&mut repos),
                     Err(e) => {
                         // Log but don't fail on permission errors
-                        debug!("Skipping {}: {}", entry_path.display(), e);
+                        debug!(path = %entry_path.display(), error = %e, "Skipping directory");
                     }
                 }
             }
@@ -226,9 +226,9 @@ pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
         Ok(r) => r,
         Err(e) => {
             warn!(
-                "Failed to open repository at {}: {}",
-                repo_path.display(),
-                e
+                path = %repo_path.display(),
+                error = %e,
+                "Failed to open repository"
             );
             return Ok(RepoStatus::NoCommits);
         }
@@ -245,9 +245,9 @@ pub fn check_repo_status_and_modification_time(
         Ok(r) => r,
         Err(e) => {
             warn!(
-                "Failed to open repository at {}: {}",
-                repo_path.display(),
-                e
+                path = %repo_path.display(),
+                error = %e,
+                "Failed to open repository"
             );
             return Ok((RepoStatus::NoCommits, None));
         }
@@ -276,9 +276,9 @@ fn check_repo_status_with_handle(repo: &gix::Repository, repo_path: &Path) -> Re
         Ok(p) => p,
         Err(e) => {
             warn!(
-                "Failed to create status platform at {}: {}",
-                repo_path.display(),
-                e
+                path = %repo_path.display(),
+                error = %e,
+                "Failed to create status platform"
             );
             return Ok(RepoStatus::Clean);
         }
@@ -292,9 +292,9 @@ fn check_repo_status_with_handle(repo: &gix::Repository, repo_path: &Path) -> Re
         Ok(mut iter) => iter.by_ref().flatten().next().is_some(),
         Err(e) => {
             warn!(
-                "Failed to check for changes at {}: {}",
-                repo_path.display(),
-                e
+                path = %repo_path.display(),
+                error = %e,
+                "Failed to check for changes"
             );
             false
         }
@@ -310,7 +310,7 @@ fn check_repo_status_with_handle(repo: &gix::Repository, repo_path: &Path) -> Re
         match repo.branch_remote_ref_name(local_branch, gix::remote::Direction::Fetch) {
             Some(Ok(name)) => name,
             Some(Err(e)) => {
-                debug!("Failed to get remote ref: {}", e);
+                debug!(error = %e, "Failed to get remote ref");
                 return Ok(RepoStatus::Clean);
             }
             None => {
@@ -325,7 +325,7 @@ fn check_repo_status_with_handle(repo: &gix::Repository, repo_path: &Path) -> Re
             let local_commit = match head_ref.id().object() {
                 Ok(obj) => obj.id,
                 Err(e) => {
-                    warn!("Failed to get local commit: {}", e);
+                    warn!(error = %e, "Failed to get local commit");
                     return Ok(RepoStatus::Clean);
                 }
             };
@@ -333,7 +333,7 @@ fn check_repo_status_with_handle(repo: &gix::Repository, repo_path: &Path) -> Re
             let remote_commit = match remote_ref.id().object() {
                 Ok(obj) => obj.id,
                 Err(e) => {
-                    warn!("Failed to get remote commit: {}", e);
+                    warn!(error = %e, "Failed to get remote commit");
                     return Ok(RepoStatus::Clean);
                 }
             };
@@ -565,16 +565,6 @@ impl Workspace {
         let local_repos = self.search(pattern)?;
 
         if !local_repos.is_empty() {
-            let repo = &local_repos[0];
-            info!("✓ Repository already in workspace: {}", repo.display());
-
-            // Check if there are any uncommitted changes or unpushed commits
-            match check_repo_status(repo)? {
-                RepoStatus::Dirty => info!("  ⚠ Has uncommitted changes"),
-                RepoStatus::Unpushed => info!("  ⚠ Has unpushed commits"),
-                _ => {}
-            }
-
             return Ok(local_repos[0].clone());
         }
 
@@ -583,25 +573,18 @@ impl Workspace {
         let repo_path = format!("{}/{}", self.path, relative_path);
 
         if self.library_contains(&relative_path) {
-            info!("📦 Restoring from library: {}", relative_path);
             self.restore_from_library(&relative_path)?;
 
             // Fetch latest changes from upstream
-            info!("  🔄 Fetching latest changes...");
             if let Err(e) = self.fetch_updates(&PathBuf::from(&repo_path)) {
-                debug!("Failed to fetch updates: {}", e);
-                info!("  ⚠ Could not fetch updates (continuing anyway)");
+                debug!(error = %e, "Failed to fetch updates");
             }
 
-            info!("✓ Restored {}", relative_path);
             return Ok(PathBuf::from(repo_path));
         }
 
         // Try to clone from remotes
-        info!("🔄 Cloning {}...", pattern.full_path());
         let repo_path = self.clone_from_remote(pattern)?;
-
-        info!("✓ Successfully cloned to: {}", repo_path.display());
         Ok(repo_path)
     }
 
@@ -614,17 +597,14 @@ impl Workspace {
 
     /// Drop a repository from this workspace
     pub fn drop(&self, pattern: &RepoPattern, delete: bool, force: bool) -> Result<()> {
-        use tracing::{debug, info, warn};
+        use tracing::{debug, warn};
 
         debug!("Drop requested for pattern: {:?}", pattern);
 
         let repos = self.search(pattern)?;
 
         if repos.is_empty() {
-            warn!(
-                "No repositories found matching pattern: {}",
-                pattern.full_path()
-            );
+            warn!(pattern = %pattern.full_path(), "No repositories found matching pattern");
             return Ok(());
         }
 
@@ -633,19 +613,13 @@ impl Workspace {
             if !force {
                 match check_repo_status(&repo)? {
                     RepoStatus::Dirty => {
-                        warn!(
-                            "⚠ Refusing to drop repository with uncommitted changes: {}",
-                            repo.display()
-                        );
-                        warn!("  Use --force to drop anyway");
+                        warn!(repo = %repo.display(), "Refusing to drop repository with uncommitted changes");
+                        warn!("Use --force to drop anyway");
                         continue;
                     }
                     RepoStatus::Unpushed => {
-                        warn!(
-                            "⚠ Refusing to drop repository with unpushed commits: {}",
-                            repo.display()
-                        );
-                        warn!("  Use --force to drop anyway");
+                        warn!(repo = %repo.display(), "Refusing to drop repository with unpushed commits");
+                        warn!("Use --force to drop anyway");
                         continue;
                     }
                     _ => {}
@@ -654,7 +628,6 @@ impl Workspace {
 
             if !delete {
                 // Store the repository in the library using workspace-relative path
-                info!("📦 Storing {} in library", repo.display());
                 let relative_path = repo
                     .strip_prefix(&self.path)
                     .unwrap_or(&repo)
@@ -662,14 +635,11 @@ impl Workspace {
                     .trim_start_matches('/')
                     .to_string();
                 self.store_in_library(&relative_path)?;
-            } else {
-                info!("🗑️  Permanently deleting {}", repo.display());
             }
 
             // Remove the directory
-            debug!("Removing directory: {:?}", &repo);
+            debug!(path = ?repo, "Removing directory");
             std::fs::remove_dir_all(&repo)?;
-            info!("✓ Dropped {}", repo.display());
         }
         Ok(())
     }
@@ -684,11 +654,8 @@ impl Workspace {
         let repos = find_git_repositories(&cwd.to_string_lossy())?;
 
         if repos.is_empty() {
-            info!("No repositories found in current directory");
             return Ok(());
         }
-
-        info!("Found {} repository(ies) in current directory", repos.len());
 
         let mut dropped = 0;
         let mut skipped = 0;
@@ -698,18 +665,10 @@ impl Workspace {
             if !force {
                 match check_repo_status(&repo)? {
                     RepoStatus::Dirty => {
-                        warn!(
-                            "⚠ Skipping repository with uncommitted changes: {}",
-                            repo.display()
-                        );
                         skipped += 1;
                         continue;
                     }
                     RepoStatus::Unpushed => {
-                        warn!(
-                            "⚠ Skipping repository with unpushed commits: {}",
-                            repo.display()
-                        );
                         skipped += 1;
                         continue;
                     }
@@ -719,7 +678,6 @@ impl Workspace {
 
             if !delete {
                 // Store the repository in the library using workspace-relative path
-                info!("📦 Storing {} in library", repo.display());
                 let relative_path = repo
                     .strip_prefix(&self.path)
                     .unwrap_or(&repo)
@@ -727,25 +685,19 @@ impl Workspace {
                     .trim_start_matches('/')
                     .to_string();
                 self.store_in_library(&relative_path)?;
-            } else {
-                info!("🗑️  Permanently deleting {}", repo.display());
             }
 
             // Remove the directory
-            debug!("Removing directory: {:?}", &repo);
+            debug!(path = ?repo, "Removing directory");
             std::fs::remove_dir_all(&repo)?;
-            info!("✓ Dropped {}", repo.display());
             dropped += 1;
         }
 
         if dropped > 0 {
-            info!("✓ Dropped {} repository(ies)", dropped);
+            info!(count = dropped, "Dropped repositories");
         }
         if skipped > 0 {
-            warn!(
-                "⚠ Skipped {} repository(ies) - use --force to drop anyway",
-                skipped
-            );
+            warn!(count = skipped, "Skipped repositories - use --force to drop anyway");
         }
 
         Ok(())
@@ -753,8 +705,6 @@ impl Workspace {
 
     /// Attempt to clone a repository from configured remotes or infer the clone URL
     fn clone_from_remote(&self, pattern: &RepoPattern) -> Result<PathBuf> {
-        use tracing::info;
-
         let dest_path = format!("{}/{}", self.path, pattern.full_path());
 
         // Try to infer the git URL from the pattern
@@ -767,8 +717,6 @@ impl Workspace {
             let clone_url = format!("https://{}/{}", provider, repo_path);
 
             std::fs::create_dir_all(std::path::Path::new(&dest_path).parent().unwrap())?;
-
-            info!("Cloning {} to {}", clone_url, dest_path);
 
             // Clone using gix
             let mut prepare_fetch = gix::clone::PrepareFetch::new(
@@ -923,7 +871,7 @@ impl Workspace {
             if let Ok(remote) = source_repo.find_remote(remote_name.as_str()) {
                 if let Some(url) = remote.url(gix::remote::Direction::Fetch) {
                     let remote_url = url.to_bstring().to_string();
-                    debug!("Restoring remote '{}' to: {}", remote_name, remote_url);
+                    debug!(remote = %remote_name, url = %remote_url, "Restoring remote");
 
                     // Find and update the URL line for this remote
                     let remote_section = format!("[remote \"{}\"]", remote_name);
@@ -991,7 +939,7 @@ impl Workspace {
 
         find_repos(&library_path, Path::new(&library_path), &mut repos)?;
 
-        debug!("Found {} repositories in library", repos.len());
+        debug!(count = repos.len(), "Found repositories in library");
         repos.sort();
         Ok(repos)
     }

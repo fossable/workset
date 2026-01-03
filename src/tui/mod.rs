@@ -266,10 +266,10 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                     // Set final message
                     if error_count == 0 {
                         log_capture
-                            .set_message(format!("✓ Dropped {} repo(s) to library", success_count));
+                            .set_message(format!("Dropped {} repo(s) to library", success_count));
                     } else {
                         log_capture.set_message(format!(
-                            "⚠ Dropped {} repo(s), {} failed",
+                            "Dropped {} repo(s), {} failed",
                             success_count, error_count
                         ));
                     }
@@ -321,12 +321,12 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                     // Set final message
                     if error_count == 0 {
                         log_capture.set_message(format!(
-                            "✓ Restored {} repo(s) from library",
+                            "Restored {} repo(s) from library",
                             success_count
                         ));
                     } else {
                         log_capture.set_message(format!(
-                            "⚠ Restored {} repo(s), {} failed",
+                            "Restored {} repo(s), {} failed",
                             success_count, error_count
                         ));
                     }
@@ -345,7 +345,7 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                 Action::CloneRepo(repo_pattern) => {
                     use crate::RepoPattern;
 
-                    log_capture.set_message(format!("🔄 Cloning repository {}...", repo_pattern));
+                    log_capture.set_message(format!("Cloning repository {}...", repo_pattern));
                     // Force a redraw to show the message immediately
                     app.last_log_message = log_capture.get_message();
                     terminal.draw(|f| ui(f, &mut app))?;
@@ -357,9 +357,9 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                     // Clone the repository
                     match workspace.open(&pattern) {
                         Ok(_) => {
-                            log_capture.set_message(format!("✓ Cloned repository {}", repo_pattern))
+                            log_capture.set_message(format!("Cloned repository {}", repo_pattern))
                         }
-                        Err(e) => log_capture.set_message(format!("✗ Failed to clone: {}", e)),
+                        Err(e) => log_capture.set_message(format!("Failed to clone: {}", e)),
                     }
                 }
                 Action::RefreshData => {
@@ -780,9 +780,9 @@ fn ui(f: &mut Frame, app: &mut App) {
                 if repo.is_submodule {
                     // Submodule indicator
                     if repo.submodule_initialized {
-                        spans.push(Span::styled("📦 ", Style::default().fg(Color::Magenta)));
+                        spans.push(Span::styled("S ", Style::default().fg(Color::Magenta)));
                     } else {
-                        spans.push(Span::styled("📦 ", Style::default().fg(Color::DarkGray)));
+                        spans.push(Span::styled("S ", Style::default().fg(Color::DarkGray)));
                         spans.push(Span::styled(
                             "(uninit) ",
                             Style::default().fg(Color::DarkGray),
@@ -791,9 +791,9 @@ fn ui(f: &mut Frame, app: &mut App) {
                 } else {
                     // Regular repo status
                     if repo.is_clean {
-                        spans.push(Span::styled("✓ ", Style::default().fg(Color::Green)));
+                        spans.push(Span::styled("+ ", Style::default().fg(Color::Green)));
                     } else {
-                        spans.push(Span::styled("⚠ ", Style::default().fg(Color::Yellow)));
+                        spans.push(Span::styled("* ", Style::default().fg(Color::Yellow)));
                     }
                 }
             }
