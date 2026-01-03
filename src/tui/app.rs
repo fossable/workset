@@ -301,6 +301,28 @@ impl App {
         update_repo_status_in_tree(&mut self.library_tree, display_name, status.clone());
         update_repo_status_in_tree(&mut self.filtered_library, display_name, status);
     }
+
+    /// Update the app with new repository data (for real-time loading)
+    pub fn update_repos(&mut self, workspace_repos: Vec<RepoInfo>, library_repos: Vec<RepoInfo>) {
+        let workspace_tree = build_tree(workspace_repos.clone());
+        let library_tree = build_library_tree(library_repos.clone(), &workspace_repos);
+
+        self.workspace_tree = workspace_tree.clone();
+        self.library_tree = library_tree.clone();
+        self.workspace_repos_list = workspace_repos;
+        self.library_repos_list = library_repos;
+        self.filtered_workspace = workspace_tree;
+        self.filtered_library = library_tree;
+
+        // Ensure something is selected if we have repos
+        if self.workspace_state.selected().is_none() && !self.workspace_tree.is_empty() {
+            self.workspace_state.select(Some(0));
+            self.active_section = Section::Workspace;
+        } else if self.library_state.selected().is_none() && !self.library_tree.is_empty() {
+            self.library_state.select(Some(0));
+            self.active_section = Section::Library;
+        }
+    }
 }
 
 fn update_repo_status_in_tree(

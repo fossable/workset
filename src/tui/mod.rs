@@ -108,19 +108,35 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
     let log_capture = LogCapture::new();
 
     loop {
-        // Collect workspace repositories
-        let workspace_repos = collect_workspace_repos(workspace);
-        let library_repos = collect_library_repos(workspace);
-
-        // Setup terminal
+        // Setup terminal FIRST so we can show progress
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        // Create app
-        let mut app = App::new(workspace_repos, library_repos);
+        // Create app with empty data initially
+        let mut app = App::new(Vec::new(), Vec::new());
+
+        // Set initial loading message
+        log_capture.set_message("Initializing...".to_string());
+        app.last_log_message = log_capture.get_message();
+
+        // Draw the initial UI to show we're loading
+        terminal.draw(|f| ui(f, &mut app))?;
+
+        // Now collect repositories with progress visible
+        // Load library repos first with empty workspace
+        let library_repos = collect_library_repos_live(workspace, &log_capture, &mut terminal, &mut app, &[]);
+        // Then collect workspace repos with the library repos
+        let workspace_repos = collect_workspace_repos_live(workspace, &log_capture, &mut terminal, &mut app, &library_repos);
+
+        // Final update with all collected data
+        app.update_repos(workspace_repos, library_repos);
+
+        // Clear the loading message now that we're done
+        log_capture.set_message(String::new());
+        app.last_log_message = log_capture.get_message();
 
         // Setup filesystem watcher with debouncing
         let (watcher_tx, watcher_rx) = channel();
@@ -278,8 +294,8 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                     std::thread::sleep(std::time::Duration::from_millis(500));
 
                     // Reload repository data and rebuild the app state
-                    let workspace_repos = collect_workspace_repos(workspace);
-                    let library_repos = collect_library_repos(workspace);
+                    let workspace_repos = collect_workspace_repos(workspace, &log_capture);
+                    let library_repos = collect_library_repos(workspace, &log_capture);
 
                     // Rebuild app with fresh data
                     app = App::new(workspace_repos, library_repos);
@@ -335,8 +351,8 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                     std::thread::sleep(std::time::Duration::from_millis(500));
 
                     // Reload repository data and rebuild the app state
-                    let workspace_repos = collect_workspace_repos(workspace);
-                    let library_repos = collect_library_repos(workspace);
+                    let workspace_repos = collect_workspace_repos(workspace, &log_capture);
+                    let library_repos = collect_library_repos(workspace, &log_capture);
 
                     // Rebuild app with fresh data
                     app = App::new(workspace_repos, library_repos);
@@ -364,8 +380,8 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                 }
                 Action::RefreshData => {
                     // Filesystem changed - reload repository data
-                    let workspace_repos = collect_workspace_repos(workspace);
-                    let library_repos = collect_library_repos(workspace);
+                    let workspace_repos = collect_workspace_repos(workspace, &log_capture);
+                    let library_repos = collect_library_repos(workspace, &log_capture);
 
                     // Rebuild app with fresh data
                     app = App::new(workspace_repos, library_repos);
@@ -791,7 +807,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                 } else {
                     // Regular repo status
                     if repo.is_clean {
-                        spans.push(Span::styled("+ ", Style::default().fg(Color::Green)));
+                        spans.push(Span::styled("✓ ", Style::default().fg(Color::Green)));
                     } else {
                         spans.push(Span::styled("* ", Style::default().fg(Color::Yellow)));
                     }
@@ -1228,8 +1244,152 @@ fn render_highlighted_name<'a>(
     spans
 }
 
-/// Collect workspace repositories with metadata
-fn collect_workspace_repos(workspace: &Workspace) -> Vec<RepoInfo> {
+/// Collect workspace repositories with metadata (with live UI updates)
+fn collect_workspace_repos_live<B: ratatui::backend::Backend>(
+    workspace: &Workspace,
+    log_capture: &LogCapture,
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    library_repos: &[RepoInfo],
+) -> Vec<RepoInfo> {
+    let repos = find_git_repositories(&workspace.path).unwrap_or_default();
+    let mut repo_infos = Vec::new();
+    let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let total_repos = repos.len();
+
+    for (idx, path) in repos.into_iter().enumerate() {
+        let display_name = path
+            .strip_prefix(&workspace.path)
+            .unwrap_or(&path)
+            .display()
+            .to_string()
+            .trim_start_matches('/')
+            .to_string();
+
+        // Update progress with current repo being processed
+        let spinner = spinner_frames[idx % spinner_frames.len()];
+        log_capture.set_message(format!(
+            "{} Loading workspace: {} ({}/{})",
+            spinner, display_name, idx + 1, total_repos
+        ));
+        app.last_log_message = log_capture.get_message();
+
+        // Check repo status and get modification time in a single repo open for performance
+        let (status, modification_time) = crate::check_repo_status_and_modification_time(&path)
+            .unwrap_or((crate::RepoStatus::NoCommits, None));
+
+        // A repo is only clean if it has commits, no changes, and no unpushed commits
+        let is_clean = matches!(status, crate::RepoStatus::Clean);
+
+        // Size not computed for workspace repos to save time
+        let size_bytes = None;
+
+        // Add the main repository
+        repo_infos.push(RepoInfo {
+            path: path.clone(),
+            display_name: display_name.clone(),
+            is_clean,
+            modification_time,
+            size_bytes,
+            operation_status: tree::RepoOperationStatus::None,
+            is_submodule: false,
+            submodule_initialized: false,
+            parent_repo_path: None,
+        });
+
+        // Update the app tree with current repos and redraw
+        app.update_repos(repo_infos.clone(), library_repos.to_vec());
+        let _ = terminal.draw(|f| ui(f, app));
+
+        // Find and add submodules
+        if let Ok(submodules) = crate::find_submodules_in_repo(&path) {
+            for (sub_idx, submodule) in submodules.iter().enumerate() {
+                let submodule_display_name = if display_name.is_empty() {
+                    submodule.path.display().to_string()
+                } else {
+                    format!("{}/{}", display_name, submodule.path.display())
+                };
+
+                // Update progress for submodule with spinner
+                let spinner = spinner_frames[(idx + sub_idx) % spinner_frames.len()];
+                log_capture.set_message(format!(
+                    "{} Loading submodule: {}",
+                    spinner, submodule_display_name
+                ));
+                app.last_log_message = log_capture.get_message();
+
+                repo_infos.push(RepoInfo {
+                    path: path.join(&submodule.path),
+                    display_name: submodule_display_name,
+                    is_clean: true, // Submodule status computed separately
+                    modification_time: None,
+                    size_bytes: None,
+                    operation_status: tree::RepoOperationStatus::None,
+                    is_submodule: true,
+                    submodule_initialized: submodule.initialized,
+                    parent_repo_path: Some(path.clone()),
+                });
+
+                // Update the app tree with current repos including submodule and redraw
+                app.update_repos(repo_infos.clone(), library_repos.to_vec());
+                let _ = terminal.draw(|f| ui(f, app));
+            }
+        }
+    }
+
+    repo_infos
+}
+
+/// Collect library repositories with metadata (with live UI updates)
+fn collect_library_repos_live<B: ratatui::backend::Backend>(
+    workspace: &Workspace,
+    log_capture: &LogCapture,
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    workspace_repos: &[RepoInfo],
+) -> Vec<RepoInfo> {
+    let library_repos = workspace.list_library().unwrap_or_default();
+    let mut repo_infos = Vec::new();
+    let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let total_repos = library_repos.len();
+
+    for (idx, repo_path) in library_repos.into_iter().enumerate() {
+        // Update progress with current library repo being processed
+        let spinner = spinner_frames[idx % spinner_frames.len()];
+        log_capture.set_message(format!(
+            "{} Loading library: {} ({}/{})",
+            spinner, repo_path, idx + 1, total_repos
+        ));
+        app.last_log_message = log_capture.get_message();
+
+        let full_path = PathBuf::from(&workspace.library_path()).join(&repo_path);
+        // Get modification time for library repos
+        let modification_time = get_repo_modification_time(&full_path, true).ok();
+        // Get size for library repos
+        let size_bytes = get_repo_size(&full_path).ok();
+
+        repo_infos.push(RepoInfo {
+            path: full_path,
+            display_name: repo_path,
+            is_clean: true, // Library repos are always clean
+            modification_time,
+            size_bytes,
+            operation_status: tree::RepoOperationStatus::None,
+            is_submodule: false,
+            submodule_initialized: false,
+            parent_repo_path: None,
+        });
+
+        // Update the app tree with current repos and redraw
+        app.update_repos(workspace_repos.to_vec(), repo_infos.clone());
+        let _ = terminal.draw(|f| ui(f, app));
+    }
+
+    repo_infos
+}
+
+/// Collect workspace repositories with metadata (without UI updates - for reloads)
+fn collect_workspace_repos(workspace: &Workspace, log_capture: &LogCapture) -> Vec<RepoInfo> {
     let repos = find_git_repositories(&workspace.path).unwrap_or_default();
     let mut repo_infos = Vec::new();
 
@@ -1241,6 +1401,9 @@ fn collect_workspace_repos(workspace: &Workspace) -> Vec<RepoInfo> {
             .to_string()
             .trim_start_matches('/')
             .to_string();
+
+        // Update progress message (won't be visible during reload)
+        log_capture.set_message(format!("Loading workspace: {}", display_name));
 
         // Check repo status and get modification time in a single repo open for performance
         let (status, modification_time) = crate::check_repo_status_and_modification_time(&path)
@@ -1274,6 +1437,9 @@ fn collect_workspace_repos(workspace: &Workspace) -> Vec<RepoInfo> {
                     format!("{}/{}", display_name, submodule.path.display())
                 };
 
+                // Update progress for submodule
+                log_capture.set_message(format!("Loading submodule: {}", submodule_display_name));
+
                 repo_infos.push(RepoInfo {
                     path: path.join(&submodule.path),
                     display_name: submodule_display_name,
@@ -1292,32 +1458,35 @@ fn collect_workspace_repos(workspace: &Workspace) -> Vec<RepoInfo> {
     repo_infos
 }
 
-/// Collect library repositories with metadata
-fn collect_library_repos(workspace: &Workspace) -> Vec<RepoInfo> {
-    workspace
-        .list_library()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|repo_path| {
-            let full_path = PathBuf::from(&workspace.library_path()).join(&repo_path);
-            // Get modification time for library repos
-            let modification_time = get_repo_modification_time(&full_path, true).ok();
-            // Get size for library repos
-            let size_bytes = get_repo_size(&full_path).ok();
+/// Collect library repositories with metadata (without UI updates - for reloads)
+fn collect_library_repos(workspace: &Workspace, log_capture: &LogCapture) -> Vec<RepoInfo> {
+    let library_repos = workspace.list_library().unwrap_or_default();
+    let mut repo_infos = Vec::new();
 
-            RepoInfo {
-                path: full_path,
-                display_name: repo_path,
-                is_clean: true, // Library repos are always clean
-                modification_time,
-                size_bytes,
-                operation_status: tree::RepoOperationStatus::None,
-                is_submodule: false,
-                submodule_initialized: false,
-                parent_repo_path: None,
-            }
-        })
-        .collect()
+    for repo_path in library_repos {
+        // Update progress message (won't be visible during reload)
+        log_capture.set_message(format!("Loading library: {}", repo_path));
+
+        let full_path = PathBuf::from(&workspace.library_path()).join(&repo_path);
+        // Get modification time for library repos
+        let modification_time = get_repo_modification_time(&full_path, true).ok();
+        // Get size for library repos
+        let size_bytes = get_repo_size(&full_path).ok();
+
+        repo_infos.push(RepoInfo {
+            path: full_path,
+            display_name: repo_path,
+            is_clean: true, // Library repos are always clean
+            modification_time,
+            size_bytes,
+            operation_status: tree::RepoOperationStatus::None,
+            is_submodule: false,
+            submodule_initialized: false,
+            parent_repo_path: None,
+        });
+    }
+
+    repo_infos
 }
 
 /// Get the configured GitHub hostname from gh CLI
