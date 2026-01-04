@@ -118,7 +118,11 @@ fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<
                 }
             }
 
-            info!(cloned = cloned, skipped = skipped, "Completed cloning repositories");
+            info!(
+                cloned = cloned,
+                skipped = skipped,
+                "Completed cloning repositories"
+            );
             return Ok(());
         }
     }
@@ -206,7 +210,10 @@ fn restore_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Resul
         return Ok(());
     }
 
-    info!(count = matching_repos.len(), "Found matching repositories in library");
+    info!(
+        count = matching_repos.len(),
+        "Found matching repositories in library"
+    );
 
     let mut restored = 0;
     let mut skipped = 0;
@@ -230,7 +237,11 @@ fn restore_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Resul
         }
     }
 
-    info!(restored = restored, skipped = skipped, "Completed restoring repositories");
+    info!(
+        restored = restored,
+        skipped = skipped,
+        "Completed restoring repositories"
+    );
     Ok(())
 }
 

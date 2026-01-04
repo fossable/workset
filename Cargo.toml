@@ -1,7 +1,7 @@
 [package]
 name = "workset"
 description = "Manage git repos with worksets"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 authors = ["cilki"]
 repository = "https://github.com/fossable/workset/"
@@ -14,14 +14,14 @@ categories = ["command-line-utilities", "development-tools"]
 anyhow = "1.0.100"
 crossterm = { version = "0.29", optional = true }
 fuzzy-matcher = { version = "0.3", optional = true }
-gix = { version = "0.75", features = [
+gix = { version = "0.77", features = [
   "blocking-network-client",
   "blocking-http-transport-reqwest-rust-tls",
 ] }
 home = "0.5"
 notify = { version = "6.1.1", optional = true } # TODO infinite recursion starting with 7.0.0
 pico-args = "0.5"
-ratatui = { version = "0.29", optional = true }
+ratatui = { version = "0.30", optional = true }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1.41"

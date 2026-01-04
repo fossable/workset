@@ -7,7 +7,7 @@ use metadata::{format_size, format_time_ago_verbose, get_repo_modification_time,
 use tree::RepoInfo;
 
 use crate::{Workspace, find_git_repositories};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
@@ -127,9 +127,16 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
 
         // Now collect repositories with progress visible
         // Load library repos first with empty workspace
-        let library_repos = collect_library_repos_live(workspace, &log_capture, &mut terminal, &mut app, &[]);
+        let library_repos =
+            collect_library_repos_live(workspace, &log_capture, &mut terminal, &mut app, &[]);
         // Then collect workspace repos with the library repos
-        let workspace_repos = collect_workspace_repos_live(workspace, &log_capture, &mut terminal, &mut app, &library_repos);
+        let workspace_repos = collect_workspace_repos_live(
+            workspace,
+            &log_capture,
+            &mut terminal,
+            &mut app,
+            &library_repos,
+        );
 
         // Final update with all collected data
         app.update_repos(workspace_repos, library_repos);
@@ -402,7 +409,9 @@ fn run_app<B: ratatui::backend::Backend>(
         // Update the app with the latest log message
         app.last_log_message = log_capture.get_message();
 
-        terminal.draw(|f| ui(f, app))?;
+        terminal
+            .draw(|f| ui(f, app))
+            .map_err(|e| anyhow!("Failed to render frame: {}", e))?;
 
         // Check for filesystem changes
         match watcher_rx.try_recv() {
@@ -1270,7 +1279,10 @@ fn collect_workspace_repos_live<B: ratatui::backend::Backend>(
         let spinner = spinner_frames[idx % spinner_frames.len()];
         log_capture.set_message(format!(
             "{} Loading workspace: {} ({}/{})",
-            spinner, display_name, idx + 1, total_repos
+            spinner,
+            display_name,
+            idx + 1,
+            total_repos
         ));
         app.last_log_message = log_capture.get_message();
 
@@ -1358,7 +1370,10 @@ fn collect_library_repos_live<B: ratatui::backend::Backend>(
         let spinner = spinner_frames[idx % spinner_frames.len()];
         log_capture.set_message(format!(
             "{} Loading library: {} ({}/{})",
-            spinner, repo_path, idx + 1, total_repos
+            spinner,
+            repo_path,
+            idx + 1,
+            total_repos
         ));
         app.last_log_message = log_capture.get_message();
 

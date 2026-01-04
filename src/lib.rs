@@ -697,7 +697,10 @@ impl Workspace {
             info!(count = dropped, "Dropped repositories");
         }
         if skipped > 0 {
-            warn!(count = skipped, "Skipped repositories - use --force to drop anyway");
+            warn!(
+                count = skipped,
+                "Skipped repositories - use --force to drop anyway"
+            );
         }
 
         Ok(())
