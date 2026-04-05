@@ -223,10 +223,9 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
 
                     log_capture.set_message(format!("Opening shell at: {}", path.display()));
 
-                    // Try to detect the actual parent shell
-                    let shell = detect_parent_shell().unwrap_or_else(|| {
-                        // Fallback to SHELL env var
-                        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+                    // Use $SHELL or try to detect the actual parent shell
+                    let shell = std::env::var("SHELL").unwrap_or_else(|_| {
+                        detect_parent_shell().unwrap_or_else(|| "/bin/sh".to_string())
                     });
 
                     // Spawn an interactive shell in the repository directory

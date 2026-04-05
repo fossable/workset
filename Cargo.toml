@@ -1,7 +1,7 @@
 [package]
 name = "workset"
 description = "Manage git repos with worksets"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 authors = ["cilki"]
 repository = "https://github.com/fossable/workset/"
@@ -14,7 +14,7 @@ categories = ["command-line-utilities", "development-tools"]
 anyhow = "1.0.100"
 crossterm = { version = "0.29", optional = true }
 fuzzy-matcher = { version = "0.3", optional = true }
-gix = { version = "0.77", features = [
+gix = { version = "0.81", features = [
   "blocking-network-client",
   "blocking-http-transport-reqwest-rust-tls",
 ] }
