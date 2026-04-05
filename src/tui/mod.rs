@@ -752,10 +752,17 @@ fn ui(f: &mut Frame, app: &mut App) {
 
             // Add expand/collapse indicator
             if !node.children.is_empty() {
-                spans.push(Span::styled(
-                    if node.expanded { "▼ " } else { "▶ " },
-                    Style::default().fg(Color::Cyan),
-                ));
+                let is_git_submodule = node
+                    .repo_info
+                    .as_ref()
+                    .map(|r| r.is_submodule)
+                    .unwrap_or(false);
+                let indicator = if is_git_submodule {
+                    if node.expanded { "◇ " } else { "◆ " }
+                } else {
+                    if node.expanded { "▼ " } else { "▶ " }
+                };
+                spans.push(Span::styled(indicator, Style::default().fg(Color::Cyan)));
             } else if *depth > 0 {
                 spans.push(Span::raw("  "));
             }
