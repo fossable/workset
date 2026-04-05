@@ -19,7 +19,7 @@ gix = { version = "0.81", features = [
   "blocking-http-transport-reqwest-rust-tls",
 ] }
 home = "0.5"
-notify = { version = "6.1.1", optional = true } # TODO infinite recursion starting with 7.0.0
+notify = { version = "8.0", optional = true }
 pico-args = "0.5"
 ratatui = { version = "0.30", optional = true }
 serde_json = "1"
