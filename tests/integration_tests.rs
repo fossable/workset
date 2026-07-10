@@ -611,14 +611,12 @@ fn test_modification_time_tracking() {
     let repo_path = create_test_repo(temp_dir.path(), "time-test", 1);
 
     // Get modification time for clean repo
-    use workset::{RepoStatus, check_repo_status, get_repo_modification_time};
+    use workset::check_repo_status_and_modification_time;
 
-    let status = check_repo_status(&repo_path).unwrap();
-    let is_clean = matches!(status, RepoStatus::Clean);
-    let mod_time = get_repo_modification_time(&repo_path, is_clean);
+    let (_, mod_time) = check_repo_status_and_modification_time(&repo_path).unwrap();
 
     assert!(
-        mod_time.is_ok(),
+        mod_time.is_some(),
         "Should get modification time for clean repo"
     );
 
@@ -626,17 +624,15 @@ fn test_modification_time_tracking() {
     std::thread::sleep(std::time::Duration::from_secs(1));
     fs::write(repo_path.join("new-file.txt"), "new\n").unwrap();
 
-    let status = check_repo_status(&repo_path).unwrap();
-    let is_clean = matches!(status, RepoStatus::Clean);
-    let new_mod_time = get_repo_modification_time(&repo_path, is_clean);
+    let (_, new_mod_time) = check_repo_status_and_modification_time(&repo_path).unwrap();
 
     assert!(
-        new_mod_time.is_ok(),
+        new_mod_time.is_some(),
         "Should get modification time for dirty repo"
     );
 
     // Dirty repo time should be more recent
-    if let (Ok(old), Ok(new)) = (mod_time, new_mod_time) {
+    if let (Some(old), Some(new)) = (mod_time, new_mod_time) {
         assert!(
             new >= old,
             "Dirty repo modification time should be >= clean repo time"

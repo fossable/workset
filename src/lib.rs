@@ -1,5 +1,4 @@
 use anyhow::{Result, bail};
-use std::error::Error;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -20,37 +19,20 @@ pub struct RepoPattern {
 }
 
 impl FromStr for RepoPattern {
-    type Err = Box<dyn Error>;
+    type Err = std::convert::Infallible;
 
-    fn from_str(path: &str) -> std::prelude::v1::Result<Self, Self::Err> {
-        // Split on first '/' to separate provider from path
-        let parts: Vec<&str> = path.splitn(2, '/').collect();
-
-        if parts.len() == 2 {
-            // Has a '/', so first part might be provider
-            let first = parts[0];
-            let rest = parts[1];
-
-            // If first part looks like a domain (contains '.'), it's a provider
-            if first.contains('.') {
-                Ok(Self {
-                    provider: Some(first.to_string()),
-                    path: rest.to_string(),
-                })
-            } else {
-                // Otherwise, the whole thing is the path
-                Ok(Self {
-                    provider: None,
-                    path: path.to_string(),
-                })
-            }
-        } else {
-            // No '/', so just a simple path
-            Ok(Self {
+    fn from_str(path: &str) -> std::result::Result<Self, Self::Err> {
+        // If the first component looks like a domain (contains '.'), it's a provider
+        Ok(match path.split_once('/') {
+            Some((first, rest)) if first.contains('.') => Self {
+                provider: Some(first.to_string()),
+                path: rest.to_string(),
+            },
+            _ => Self {
                 provider: None,
                 path: path.to_string(),
-            })
-        }
+            },
+        })
     }
 }
 
@@ -86,34 +68,24 @@ pub struct SubmoduleInfo {
 
 /// Recursively find "top-level" git repositories.
 /// This function will not traverse into .git directories or nested git repositories.
-/// Find all git repositories in the given path
-pub fn find_git_repositories(path: &str) -> Result<Vec<PathBuf>> {
-    debug!(path = %path, "Recursively searching for git repositories");
+pub fn find_git_repositories(path: &Path) -> Result<Vec<PathBuf>> {
+    debug!(path = %path.display(), "Recursively searching for git repositories");
     let mut found: Vec<PathBuf> = Vec::new();
-    let path_buf = PathBuf::from(path);
 
     // Check if this path itself is a git repository
-    if path_buf.join(".git").exists() {
-        found.push(path_buf);
+    if path.join(".git").exists() {
+        found.push(path.to_path_buf());
         return Ok(found); // Don't traverse into git repositories
     }
 
     // Otherwise, recursively search subdirectories
-    if let Ok(entries) = std::fs::read_dir(&path_buf) {
+    if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.filter_map(|e| e.ok()) {
             let entry_path = entry.path();
 
-            // Skip .git directory itself (it's not a repo container)
-            if let Some(name) = entry_path.file_name() {
-                let name_str = name.to_string_lossy();
-                if name_str == ".git" {
-                    continue;
-                }
-            }
-
             // Only traverse directories
             if entry_path.is_dir() {
-                match find_git_repositories(&entry_path.to_string_lossy()) {
+                match find_git_repositories(&entry_path) {
                     Ok(mut repos) => found.append(&mut repos),
                     Err(e) => {
                         // Log but don't fail on permission errors
@@ -207,6 +179,28 @@ pub fn find_submodules_in_repo(repo_path: &Path) -> Result<Vec<SubmoduleInfo>> {
     Ok(submodules)
 }
 
+/// Clone a repository (from a remote URL or a local path) into the given
+/// destination directory, creating parent directories as needed
+pub fn gix_clone(url: &str, dest: &Path) -> Result<gix::Repository> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut prepare_fetch = gix::clone::PrepareFetch::new(
+        url,
+        dest,
+        gix::create::Kind::WithWorktree,
+        gix::create::Options::default(),
+        gix::open::Options::isolated(),
+    )?;
+    let should_interrupt = std::sync::atomic::AtomicBool::new(false);
+    let (mut prepare_checkout, _) =
+        prepare_fetch.fetch_then_checkout(gix::progress::Discard, &should_interrupt)?;
+    let (repo, _) = prepare_checkout.main_worktree(gix::progress::Discard, &should_interrupt)?;
+
+    Ok(repo)
+}
+
 /// Repository status information
 #[derive(Debug)]
 pub enum RepoStatus {
@@ -237,7 +231,7 @@ pub fn check_repo_status(repo_path: &Path) -> Result<RepoStatus> {
 }
 
 /// Check repository status and get modification time in a single repo open
-/// This is more efficient than calling check_repo_status and get_repo_modification_time separately
+/// and a single worktree scan
 pub fn check_repo_status_and_modification_time(
     repo_path: &Path,
 ) -> Result<(RepoStatus, Option<std::time::SystemTime>)> {
@@ -253,22 +247,32 @@ pub fn check_repo_status_and_modification_time(
         }
     };
 
-    let status = check_repo_status_with_handle(&repo, repo_path)?;
-    let is_clean = matches!(status, RepoStatus::Clean);
-    let mod_time = get_repo_modification_time_with_handle(&repo, repo_path, is_clean).ok();
+    let (has_changes, dirty_files_time) = scan_worktree_changes(&repo, repo_path);
 
-    Ok((status, mod_time))
+    let Some(head_ref) = head_referent(&repo) else {
+        return Ok((RepoStatus::NoCommits, Some(dirty_files_time)));
+    };
+
+    if has_changes {
+        // For dirty repos, use the max of last commit time and dirty file times
+        let commit_time = get_last_commit_time(&repo).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        return Ok((RepoStatus::Dirty, Some(commit_time.max(dirty_files_time))));
+    }
+
+    let status = check_unpushed_status(&repo, head_ref);
+    Ok((status, get_last_commit_time(&repo).ok()))
 }
 
-/// Check repository status using an already-opened repository handle
+/// Get the HEAD reference, or None if the repository has no commits
+fn head_referent(repo: &gix::Repository) -> Option<gix::Reference<'_>> {
+    repo.head().ok()?.try_into_referent()
+}
+
+/// Check repository status using an already-opened repository handle.
+/// Stops scanning the worktree at the first change found.
 fn check_repo_status_with_handle(repo: &gix::Repository, repo_path: &Path) -> Result<RepoStatus> {
-    // Check if repo has commits
-    let head_ref = match repo.head() {
-        Ok(head) => match head.try_into_referent() {
-            Some(head_ref) => head_ref,
-            None => return Ok(RepoStatus::NoCommits),
-        },
-        Err(_) => return Ok(RepoStatus::NoCommits),
+    let Some(head_ref) = head_referent(repo) else {
+        return Ok(RepoStatus::NoCommits);
     };
 
     // Check for uncommitted changes using a single status call
@@ -304,18 +308,22 @@ fn check_repo_status_with_handle(repo: &gix::Repository, repo_path: &Path) -> Re
         return Ok(RepoStatus::Dirty);
     }
 
-    // Check for unpushed commits
+    Ok(check_unpushed_status(repo, head_ref))
+}
+
+/// Classify a repository with no uncommitted changes as Clean or Unpushed
+fn check_unpushed_status(repo: &gix::Repository, head_ref: gix::Reference<'_>) -> RepoStatus {
     let local_branch = head_ref.name();
     let remote_ref_name =
         match repo.branch_remote_ref_name(local_branch, gix::remote::Direction::Fetch) {
             Some(Ok(name)) => name,
             Some(Err(e)) => {
                 debug!(error = %e, "Failed to get remote ref");
-                return Ok(RepoStatus::Clean);
+                return RepoStatus::Clean;
             }
             None => {
                 debug!("No upstream branch configured");
-                return Ok(RepoStatus::Clean);
+                return RepoStatus::Clean;
             }
         };
 
@@ -326,7 +334,7 @@ fn check_repo_status_with_handle(repo: &gix::Repository, repo_path: &Path) -> Re
                 Ok(obj) => obj.id,
                 Err(e) => {
                     warn!(error = %e, "Failed to get local commit");
-                    return Ok(RepoStatus::Clean);
+                    return RepoStatus::Clean;
                 }
             };
 
@@ -334,7 +342,7 @@ fn check_repo_status_with_handle(repo: &gix::Repository, repo_path: &Path) -> Re
                 Ok(obj) => obj.id,
                 Err(e) => {
                     warn!(error = %e, "Failed to get remote commit");
-                    return Ok(RepoStatus::Clean);
+                    return RepoStatus::Clean;
                 }
             };
 
@@ -347,9 +355,9 @@ fn check_repo_status_with_handle(repo: &gix::Repository, repo_path: &Path) -> Re
     };
 
     if has_unpushed {
-        Ok(RepoStatus::Unpushed)
+        RepoStatus::Unpushed
     } else {
-        Ok(RepoStatus::Clean)
+        RepoStatus::Clean
     }
 }
 
@@ -390,86 +398,73 @@ pub fn format_time_ago(time: std::time::SystemTime) -> String {
     }
 }
 
-/// Get the last modification time for a repository
-/// For clean repos, use last commit time. For dirty repos, use max of commit time or dirty files.
-pub fn get_repo_modification_time(
-    repo_path: &Path,
-    is_clean: bool,
-) -> Result<std::time::SystemTime> {
+/// Get the last modification time for a repository (its last commit time).
+/// Use check_repo_status_and_modification_time to also account for dirty files.
+pub fn get_repo_modification_time(repo_path: &Path) -> Result<std::time::SystemTime> {
     let repo = gix::open(repo_path)?;
-    get_repo_modification_time_with_handle(&repo, repo_path, is_clean)
-}
-
-/// Get the modification time using an already-opened repository handle
-fn get_repo_modification_time_with_handle(
-    repo: &gix::Repository,
-    repo_path: &Path,
-    is_clean: bool,
-) -> Result<std::time::SystemTime> {
-    if is_clean {
-        // For clean repos, get the last commit time
-        get_last_commit_time(repo)
-    } else {
-        // For dirty repos, get the max of last commit time and dirty file modification times
-        let commit_time = get_last_commit_time(repo).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        let dirty_files_time = get_dirty_files_modification_time(repo, repo_path)
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        Ok(commit_time.max(dirty_files_time))
-    }
+    get_last_commit_time(&repo)
 }
 
 /// Get the last commit time using gix
 fn get_last_commit_time(repo: &gix::Repository) -> Result<std::time::SystemTime> {
-    let head_ref = match repo.head() {
-        Ok(head) => match head.try_into_referent() {
-            Some(head_ref) => head_ref,
-            None => bail!("Failed to get head referent"),
-        },
-        Err(e) => bail!("Failed to get head: {}", e),
+    let Some(head_ref) = head_referent(repo) else {
+        bail!("Repository has no commits");
     };
 
-    let commit = match head_ref.id().object() {
-        Ok(obj) => obj.try_into_commit()?,
-        Err(e) => bail!("Failed to get commit object: {}", e),
-    };
+    let commit = head_ref.id().object()?.try_into_commit()?;
+    let timestamp = commit.time()?.seconds;
 
-    let commit_time = commit.time()?;
-    let timestamp = commit_time.seconds;
-    let system_time =
-        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(timestamp as u64);
-
-    Ok(system_time)
+    Ok(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(timestamp as u64))
 }
 
-/// Get the most recent modification time of dirty files
-fn get_dirty_files_modification_time(
+/// Scan the worktree once, returning whether any changes or untracked files
+/// exist and the most recent modification time among them
+fn scan_worktree_changes(
     repo: &gix::Repository,
     repo_path: &Path,
-) -> Result<std::time::SystemTime> {
+) -> (bool, std::time::SystemTime) {
+    let mut has_changes = false;
     let mut latest_time = std::time::SystemTime::UNIX_EPOCH;
 
-    // Use a single status call and configure it to include both tracked changes and untracked files
-    let platform = repo.status(gix::progress::Discard)?;
+    let platform = match repo.status(gix::progress::Discard) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                path = %repo_path.display(),
+                error = %e,
+                "Failed to create status platform"
+            );
+            return (has_changes, latest_time);
+        }
+    };
 
-    // Get an iterator that includes both index-worktree changes AND untracked files
-    if let Ok(iter) = platform
+    // Iterate both tracked changes and untracked files in one pass
+    match platform
         .untracked_files(gix::status::UntrackedFiles::Files)
         .into_index_worktree_iter(Vec::new())
     {
-        for item in iter.flatten() {
-            let rela_path = item.rela_path();
-            let file_path = repo_path.join(gix::path::from_bstr(rela_path));
-            if let Ok(metadata) = std::fs::metadata(&file_path)
-                && let Ok(modified) = metadata.modified()
-                && modified > latest_time
-            {
-                latest_time = modified;
+        Ok(iter) => {
+            for item in iter.flatten() {
+                has_changes = true;
+                let file_path = repo_path.join(gix::path::from_bstr(item.rela_path()));
+                if let Ok(metadata) = std::fs::metadata(&file_path)
+                    && let Ok(modified) = metadata.modified()
+                    && modified > latest_time
+                {
+                    latest_time = modified;
+                }
             }
+        }
+        Err(e) => {
+            warn!(
+                path = %repo_path.display(),
+                error = %e,
+                "Failed to check for changes"
+            );
         }
     }
 
-    // Return the latest time found (could be UNIX_EPOCH if no files found)
-    Ok(latest_time)
+    (has_changes, latest_time)
 }
 
 /// A `Workspace` is filesystem directory containing git repositories checked out
@@ -482,20 +477,6 @@ fn get_dirty_files_modification_time(
 pub struct Workspace {
     /// The workspace directory's filesystem path
     pub path: String,
-}
-
-impl Default for Workspace {
-    fn default() -> Self {
-        let home = home::home_dir().expect("the home directory exists");
-
-        Self {
-            path: std::env::current_dir()
-                .ok()
-                .unwrap_or_else(|| home.join("workspace"))
-                .display()
-                .to_string(),
-        }
-    }
 }
 
 impl Workspace {
@@ -553,8 +534,7 @@ impl Workspace {
 
     /// Search the workspace for local repos matching the given pattern.
     pub fn search(&self, pattern: &RepoPattern) -> Result<Vec<PathBuf>> {
-        let repos = find_git_repositories(&format!("{}/{}", self.path, pattern.full_path()))?;
-        Ok(repos)
+        find_git_repositories(&Path::new(&self.path).join(pattern.full_path()))
     }
 
     /// Clone/open a repository in this workspace
@@ -574,12 +554,7 @@ impl Workspace {
 
         if self.library_contains(&relative_path) {
             self.restore_from_library(&relative_path)?;
-
-            // Fetch latest changes from upstream
-            if let Err(e) = self.fetch_updates(&PathBuf::from(&repo_path)) {
-                debug!(error = %e, "Failed to fetch updates");
-            }
-
+            // TODO: fetch latest changes from upstream once the gix API is clearer
             return Ok(PathBuf::from(repo_path));
         }
 
@@ -588,17 +563,8 @@ impl Workspace {
         Ok(repo_path)
     }
 
-    /// Fetch updates for a repository
-    fn fetch_updates(&self, _repo_path: &Path) -> Result<()> {
-        // TODO: Implement fetch using gix once the API is clearer
-        // For now, repositories are restored as-is from the library
-        Ok(())
-    }
-
     /// Drop a repository from this workspace
     pub fn drop(&self, pattern: &RepoPattern, delete: bool, force: bool) -> Result<()> {
-        use tracing::{debug, warn};
-
         debug!("Drop requested for pattern: {:?}", pattern);
 
         let repos = self.search(pattern)?;
@@ -609,88 +575,25 @@ impl Workspace {
         }
 
         for repo in repos {
-            // Check for uncommitted changes unless --force is given
-            if !force {
-                match check_repo_status(&repo)? {
-                    RepoStatus::Dirty => {
-                        warn!(repo = %repo.display(), "Refusing to drop repository with uncommitted changes");
-                        warn!("Use --force to drop anyway");
-                        continue;
-                    }
-                    RepoStatus::Unpushed => {
-                        warn!(repo = %repo.display(), "Refusing to drop repository with unpushed commits");
-                        warn!("Use --force to drop anyway");
-                        continue;
-                    }
-                    _ => {}
-                }
-            }
-
-            if !delete {
-                // Store the repository in the library using workspace-relative path
-                let relative_path = repo
-                    .strip_prefix(&self.path)
-                    .unwrap_or(&repo)
-                    .to_string_lossy()
-                    .trim_start_matches('/')
-                    .to_string();
-                self.store_in_library(&relative_path)?;
-            }
-
-            // Remove the directory
-            debug!(path = ?repo, "Removing directory");
-            std::fs::remove_dir_all(&repo)?;
+            self.drop_repo(&repo, delete, force)?;
         }
         Ok(())
     }
 
     /// Drop all repositories in the current directory
     pub fn drop_all(&self, delete: bool, force: bool) -> Result<()> {
-        use tracing::{debug, info, warn};
-
         debug!("Drop all requested in current directory");
 
         let cwd = std::env::current_dir()?;
-        let repos = find_git_repositories(&cwd.to_string_lossy())?;
-
-        if repos.is_empty() {
-            return Ok(());
-        }
-
         let mut dropped = 0;
         let mut skipped = 0;
 
-        for repo in repos {
-            // Check for uncommitted changes unless --force is given
-            if !force {
-                match check_repo_status(&repo)? {
-                    RepoStatus::Dirty => {
-                        skipped += 1;
-                        continue;
-                    }
-                    RepoStatus::Unpushed => {
-                        skipped += 1;
-                        continue;
-                    }
-                    _ => {}
-                }
+        for repo in find_git_repositories(&cwd)? {
+            if self.drop_repo(&repo, delete, force)? {
+                dropped += 1;
+            } else {
+                skipped += 1;
             }
-
-            if !delete {
-                // Store the repository in the library using workspace-relative path
-                let relative_path = repo
-                    .strip_prefix(&self.path)
-                    .unwrap_or(&repo)
-                    .to_string_lossy()
-                    .trim_start_matches('/')
-                    .to_string();
-                self.store_in_library(&relative_path)?;
-            }
-
-            // Remove the directory
-            debug!(path = ?repo, "Removing directory");
-            std::fs::remove_dir_all(&repo)?;
-            dropped += 1;
         }
 
         if dropped > 0 {
@@ -706,35 +609,57 @@ impl Workspace {
         Ok(())
     }
 
+    /// Drop a single repository: store it in the library (unless deleting) and
+    /// remove it from the workspace. Returns false if the repo was skipped
+    /// because it has uncommitted or unpushed changes.
+    fn drop_repo(&self, repo: &Path, delete: bool, force: bool) -> Result<bool> {
+        // Check for uncommitted changes unless --force is given
+        if !force {
+            match check_repo_status(repo)? {
+                RepoStatus::Dirty => {
+                    warn!(repo = %repo.display(), "Refusing to drop repository with uncommitted changes");
+                    warn!("Use --force to drop anyway");
+                    return Ok(false);
+                }
+                RepoStatus::Unpushed => {
+                    warn!(repo = %repo.display(), "Refusing to drop repository with unpushed commits");
+                    warn!("Use --force to drop anyway");
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+
+        if !delete {
+            // Store the repository in the library using workspace-relative path
+            let relative_path = repo
+                .strip_prefix(&self.path)
+                .unwrap_or(repo)
+                .to_string_lossy()
+                .trim_start_matches('/')
+                .to_string();
+            self.store_in_library(&relative_path)?;
+        }
+
+        // Remove the directory
+        debug!(path = ?repo, "Removing directory");
+        std::fs::remove_dir_all(repo)?;
+        Ok(true)
+    }
+
     /// Attempt to clone a repository from configured remotes or infer the clone URL
     fn clone_from_remote(&self, pattern: &RepoPattern) -> Result<PathBuf> {
-        let dest_path = format!("{}/{}", self.path, pattern.full_path());
-
         // Try to infer the git URL from the pattern
         // Pattern could be:
         // - github.com/user/repo (with provider)
         // - user/repo (without provider, check configured remotes)
-
         if let Some((provider, repo_path)) = pattern.provider_and_path() {
             // Has provider like github.com/user/repo
             let clone_url = format!("https://{}/{}", provider, repo_path);
+            let dest_path = Path::new(&self.path).join(pattern.full_path());
 
-            std::fs::create_dir_all(std::path::Path::new(&dest_path).parent().unwrap())?;
-
-            // Clone using gix
-            let mut prepare_fetch = gix::clone::PrepareFetch::new(
-                clone_url,
-                std::path::Path::new(&dest_path),
-                gix::create::Kind::WithWorktree,
-                gix::create::Options::default(),
-                gix::open::Options::isolated(),
-            )?;
-            let should_interrupt = std::sync::atomic::AtomicBool::new(false);
-            let (mut prepare_checkout, _) =
-                prepare_fetch.fetch_then_checkout(gix::progress::Discard, &should_interrupt)?;
-            prepare_checkout.main_worktree(gix::progress::Discard, &should_interrupt)?;
-
-            return Ok(PathBuf::from(dest_path));
+            gix_clone(&clone_url, &dest_path)?;
+            return Ok(dest_path);
         }
 
         // No provider specified, would need to check configured remotes
@@ -749,8 +674,6 @@ impl Workspace {
     /// Move the given repository into the library.
     /// relative_path: the relative path of the repo within the workspace (e.g. "github.com/user/repo")
     pub fn store_in_library(&self, relative_path: &str) -> Result<()> {
-        use tracing::debug;
-
         let library_path = self.library_path();
 
         // Make sure the library directory exists first
@@ -821,8 +744,6 @@ impl Workspace {
     /// Restore a repository from the library to the workspace.
     /// relative_path: the relative path of the repo within the workspace (e.g. "github.com/user/repo")
     pub fn restore_from_library(&self, relative_path: &str) -> Result<()> {
-        use tracing::debug;
-
         let library_path = self.library_path();
         let source = format!("{}/{}", library_path, relative_path);
         let dest = format!("{}/{}", self.path, relative_path);
@@ -833,12 +754,6 @@ impl Workspace {
                 "Repository not found in library for path: {}",
                 relative_path
             );
-        }
-
-        // Create parent directory if needed
-        if let Some(parent) = Path::new(&dest).parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| anyhow::anyhow!("Failed to create parent directory: {}", e))?;
         }
 
         // Get all remotes from the bare repository using gix
@@ -852,18 +767,7 @@ impl Workspace {
         }
 
         // Clone from the library using gix
-        let mut prepare_fetch = gix::clone::PrepareFetch::new(
-            source.clone(),
-            std::path::Path::new(&dest),
-            gix::create::Kind::WithWorktree,
-            gix::create::Options::default(),
-            gix::open::Options::isolated(),
-        )?;
-        let should_interrupt = std::sync::atomic::AtomicBool::new(false);
-        let (mut prepare_checkout, _) =
-            prepare_fetch.fetch_then_checkout(gix::progress::Discard, &should_interrupt)?;
-        let (_dest_repo, _) =
-            prepare_checkout.main_worktree(gix::progress::Discard, &should_interrupt)?;
+        gix_clone(&source, Path::new(&dest))?;
 
         // Restore all original remote URLs by updating the config file
         let dest_config_path = std::path::Path::new(&dest).join(".git/config");
@@ -871,27 +775,26 @@ impl Workspace {
 
         for remote_name in &remote_names {
             // Get the URL for this remote from the library
-            if let Ok(remote) = source_repo.find_remote(remote_name.as_str()) {
-                if let Some(url) = remote.url(gix::remote::Direction::Fetch) {
-                    let remote_url = url.to_bstring().to_string();
-                    debug!(remote = %remote_name, url = %remote_url, "Restoring remote");
+            if let Ok(remote) = source_repo.find_remote(remote_name.as_str())
+                && let Some(url) = remote.url(gix::remote::Direction::Fetch)
+            {
+                let remote_url = url.to_bstring().to_string();
+                debug!(remote = %remote_name, url = %remote_url, "Restoring remote");
 
-                    // Find and update the URL line for this remote
-                    let remote_section = format!("[remote \"{}\"]", remote_name);
-                    if let Some(section_start) = dest_config_content.find(&remote_section) {
-                        // Find the URL line after the section start
-                        if let Some(url_line_start) =
-                            dest_config_content[section_start..].find("url = ")
-                        {
-                            let abs_url_start = section_start + url_line_start;
-                            if let Some(line_end) = dest_config_content[abs_url_start..].find('\n')
-                            {
-                                let abs_line_end = abs_url_start + line_end;
-                                dest_config_content.replace_range(
-                                    abs_url_start..abs_line_end,
-                                    &format!("\turl = {}", remote_url),
-                                );
-                            }
+                // Find and update the URL line for this remote
+                let remote_section = format!("[remote \"{}\"]", remote_name);
+                if let Some(section_start) = dest_config_content.find(&remote_section) {
+                    // Find the URL line after the section start
+                    if let Some(url_line_start) =
+                        dest_config_content[section_start..].find("url = ")
+                    {
+                        let abs_url_start = section_start + url_line_start;
+                        if let Some(line_end) = dest_config_content[abs_url_start..].find('\n') {
+                            let abs_line_end = abs_url_start + line_end;
+                            dest_config_content.replace_range(
+                                abs_url_start..abs_line_end,
+                                &format!("\turl = {}", remote_url),
+                            );
                         }
                     }
                 }
@@ -905,8 +808,6 @@ impl Workspace {
 
     /// List all repositories in the library
     pub fn list_library(&self) -> Result<Vec<String>> {
-        use tracing::debug;
-
         let library_path = self.library_path();
         if !Path::new(&library_path).exists() {
             return Ok(Vec::new());
@@ -951,14 +852,9 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error;
     use std::fs;
     use tempfile::TempDir;
-
-    #[test]
-    fn test_workspace_default() {
-        let workspace = Workspace::default();
-        assert!(!workspace.path.is_empty());
-    }
 
     #[test]
     fn test_library_contains() {
@@ -992,7 +888,7 @@ mod tests {
         let not_repo = base_path.join("not_a_repo");
         fs::create_dir_all(&not_repo).unwrap();
 
-        let repos = find_git_repositories(&base_path.to_string_lossy()).unwrap();
+        let repos = find_git_repositories(base_path).unwrap();
 
         assert_eq!(repos.len(), 2);
         assert!(repos.iter().any(|p| p.ends_with("repo1")));

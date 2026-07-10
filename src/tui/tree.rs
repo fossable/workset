@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct TreeState {
     /// Currently selected item index (in flattened view)
@@ -84,51 +84,23 @@ impl TreeNode {
         }
     }
 
-    pub fn new_submodule(
-        name: String,
-        parent_path: PathBuf,
-        submodule_path: PathBuf,
-        initialized: bool,
-    ) -> Self {
-        Self {
-            name,
-            repo_info: Some(RepoInfo {
-                path: parent_path.join(&submodule_path),
-                display_name: submodule_path.display().to_string(),
-                is_clean: true, // Submodule status computed separately
-                modification_time: None,
-                size_bytes: None,
-                operation_status: RepoOperationStatus::None,
-                is_submodule: true,
-                submodule_initialized: initialized,
-                parent_repo_path: Some(parent_path),
-            }),
-            children: Vec::new(),
-            expanded: false, // Submodules start collapsed
-        }
-    }
-
     /// Flatten the tree into a list of (node, depth, index_path, full_path) tuples
     pub fn flatten(
         &self,
         depth: usize,
         index_path: Vec<usize>,
         parent_path: &str,
-    ) -> Vec<(TreeNode, usize, Vec<usize>, String)> {
+    ) -> Vec<(&TreeNode, usize, Vec<usize>, String)> {
         // Build the full path for this node
-        let full_path = if parent_path.is_empty() {
-            if let Some(ref repo) = self.repo_info {
-                repo.display_name.clone()
-            } else {
-                self.name.clone()
-            }
-        } else if let Some(ref repo) = self.repo_info {
+        let full_path = if let Some(ref repo) = self.repo_info {
             repo.display_name.clone()
+        } else if parent_path.is_empty() {
+            self.name.clone()
         } else {
             format!("{}/{}", parent_path, self.name)
         };
 
-        let mut result = vec![(self.clone(), depth, index_path.clone(), full_path.clone())];
+        let mut result = vec![(self, depth, index_path.clone(), full_path.clone())];
 
         if self.expanded {
             for (i, child) in self.children.iter().enumerate() {
@@ -234,47 +206,36 @@ pub fn build_tree(mut repos: Vec<RepoInfo>) -> Vec<TreeNode> {
 }
 
 /// Helper function to insert a submodule into the tree as a child of its parent repo
-fn insert_submodule_into_tree(root_nodes: &mut Vec<TreeNode>, submodule: RepoInfo) {
-    let parent_path = match &submodule.parent_repo_path {
+fn insert_submodule_into_tree(root_nodes: &mut [TreeNode], submodule: RepoInfo) {
+    let parent_path = match submodule.parent_repo_path.clone() {
         Some(path) => path,
         None => return, // Shouldn't happen, but skip if no parent
     };
 
-    // Find the parent repo node
-    if let Some(parent_node) = find_repo_node_by_path(root_nodes, parent_path) {
-        // Create submodule node
-        let submodule_name = submodule
+    // Find the parent repo node and add the submodule as a child
+    if let Some(parent_node) = find_repo_node_by_path(root_nodes, &parent_path) {
+        let name = submodule
             .path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(&submodule.display_name)
             .to_string();
 
-        let submodule_node = TreeNode::new_submodule(
-            submodule_name,
-            parent_path.clone(),
-            submodule
-                .path
-                .strip_prefix(parent_path)
-                .unwrap_or(&submodule.path)
-                .to_path_buf(),
-            submodule.submodule_initialized,
-        );
-
-        // Add as child of parent
-        parent_node.children.push(submodule_node);
+        parent_node.children.push(TreeNode {
+            name,
+            repo_info: Some(submodule),
+            children: Vec::new(),
+            expanded: false, // Submodules start collapsed
+        });
     }
 }
 
 /// Recursively find a tree node by its repository path
-fn find_repo_node_by_path<'a>(
-    nodes: &'a mut Vec<TreeNode>,
-    path: &PathBuf,
-) -> Option<&'a mut TreeNode> {
+fn find_repo_node_by_path<'a>(nodes: &'a mut [TreeNode], path: &Path) -> Option<&'a mut TreeNode> {
     for node in nodes {
         // Check if this node matches
         if let Some(ref repo_info) = node.repo_info
-            && &repo_info.path == path
+            && repo_info.path == path
         {
             return Some(node);
         }
@@ -306,7 +267,7 @@ pub fn build_library_tree(
 }
 
 /// Flatten a forest of trees into a list
-pub fn flatten_trees(trees: &[TreeNode]) -> Vec<(TreeNode, usize, Vec<usize>, String)> {
+pub fn flatten_trees(trees: &[TreeNode]) -> Vec<(&TreeNode, usize, Vec<usize>, String)> {
     let mut result = Vec::new();
     for (i, tree) in trees.iter().enumerate() {
         result.extend(tree.flatten(0, vec![i], ""));
@@ -319,28 +280,19 @@ pub fn count_repos_in_trees(trees: &[TreeNode]) -> usize {
     trees.iter().map(|t| t.count_repos()).sum()
 }
 
-pub fn toggle_node_at_path(trees: &mut [TreeNode], path: &[usize]) {
-    if path.is_empty() {
+pub fn toggle_node_at_path(mut nodes: &mut [TreeNode], path: &[usize]) {
+    let Some((&last, parents)) = path.split_last() else {
         return;
-    }
+    };
 
-    if path.len() == 1 {
-        if let Some(node) = trees.get_mut(path[0]) {
-            node.toggle_expand();
+    for &idx in parents {
+        match nodes.get_mut(idx) {
+            Some(node) => nodes = &mut node.children,
+            None => return,
         }
-    } else if let Some(node) = trees.get_mut(path[0]) {
-        toggle_node_at_path_impl(node, &path[1..]);
     }
-}
 
-fn toggle_node_at_path_impl(node: &mut TreeNode, path: &[usize]) {
-    if path.is_empty() {
+    if let Some(node) = nodes.get_mut(last) {
         node.toggle_expand();
-    } else if path.len() == 1 {
-        if let Some(child) = node.children.get_mut(path[0]) {
-            child.toggle_expand();
-        }
-    } else if let Some(child) = node.children.get_mut(path[0]) {
-        toggle_node_at_path_impl(child, &path[1..]);
     }
 }

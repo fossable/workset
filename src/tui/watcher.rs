@@ -134,7 +134,10 @@ mod tests {
 
         assert!(first_refresh, "First refresh should trigger");
         assert!(!second_refresh, "Second refresh should be debounced");
-        assert!(third_refresh, "Third refresh should trigger after debounce period");
+        assert!(
+            third_refresh,
+            "Third refresh should trigger after debounce period"
+        );
     }
 
     #[test]

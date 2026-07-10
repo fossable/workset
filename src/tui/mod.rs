@@ -5,10 +5,10 @@ mod watcher;
 
 use app::{App, AppMode, Section};
 use metadata::{format_size, format_time_ago_verbose, get_repo_modification_time, get_repo_size};
-use tree::RepoInfo;
+use tree::{RepoInfo, RepoOperationStatus, TreeNode};
 use watcher::FileWatcher;
 
-use crate::{Workspace, find_git_repositories};
+use crate::{RepoPattern, Workspace, find_git_repositories};
 use anyhow::{Result, anyhow};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
@@ -19,49 +19,17 @@ use fuzzy_matcher::FuzzyMatcher;
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
 use std::io;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, mpsc};
+use std::time::{Duration, Instant};
 
-/// Shared state for capturing log messages
-#[derive(Clone)]
-pub struct LogCapture {
-    pub last_message: Arc<Mutex<String>>,
-}
-
-impl Default for LogCapture {
-    fn default() -> Self {
-        Self {
-            last_message: Arc::new(Mutex::new(String::new())),
-        }
-    }
-}
-
-impl LogCapture {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn set_message(&self, msg: String) {
-        if let Ok(mut last) = self.last_message.lock() {
-            *last = msg;
-        }
-    }
-
-    pub fn get_message(&self) -> String {
-        self.last_message
-            .lock()
-            .ok()
-            .map(|m| m.clone())
-            .unwrap_or_default()
-    }
-}
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 enum Action {
     None,
@@ -105,8 +73,6 @@ fn detect_parent_shell() -> Option<String> {
 }
 
 pub fn run_tui(workspace: &Workspace) -> Result<()> {
-    let log_capture = LogCapture::new();
-
     loop {
         // Setup terminal FIRST so we can show progress
         enable_raw_mode()?;
@@ -117,48 +83,32 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
 
         // Create app with empty data initially
         let mut app = App::new(Vec::new(), Vec::new());
-
-        // Set initial loading message
-        log_capture.set_message("Initializing...".to_string());
-        app.last_log_message = log_capture.get_message();
-
-        // Draw the initial UI to show we're loading
+        app.last_log_message = "Initializing...".to_string();
         terminal.draw(|f| ui(f, &mut app))?;
 
-        // Now collect repositories with progress visible
-        // Load library repos first with empty workspace
-        let library_repos =
-            collect_library_repos_live(workspace, &log_capture, &mut terminal, &mut app, &[]);
-        // Then collect workspace repos with the library repos
-        let workspace_repos = collect_workspace_repos_live(
-            workspace,
-            &log_capture,
-            &mut terminal,
-            &mut app,
-            &library_repos,
-        );
+        // Collect repositories with progress visible, throttling redraws
+        let mut last_draw = Instant::now();
+        let (workspace_repos, library_repos) =
+            collect_repos(workspace, |message, workspace_repos, library_repos| {
+                if last_draw.elapsed() >= Duration::from_millis(50) {
+                    last_draw = Instant::now();
+                    app.last_log_message = message.to_string();
+                    app.update_repos(workspace_repos.to_vec(), library_repos.to_vec());
+                    let _ = terminal.draw(|f| ui(f, &mut app));
+                }
+            });
 
         // Final update with all collected data
         app.update_repos(workspace_repos, library_repos);
-
-        // Clear the loading message now that we're done
-        log_capture.set_message(String::new());
-        app.last_log_message = log_capture.get_message();
+        app.last_log_message.clear();
 
         // Setup filesystem watcher with debouncing
         let workspace_path = PathBuf::from(&workspace.path);
-        let mut file_watcher =
-            FileWatcher::new(&workspace_path, Duration::from_millis(500))?;
+        let mut file_watcher = FileWatcher::new(&workspace_path, Duration::from_millis(500))?;
 
         // Inner loop to handle actions without tearing down terminal
         loop {
-            // Run app with the file watcher
-            let action = run_app(
-                &mut terminal,
-                &mut app,
-                log_capture.clone(),
-                &mut file_watcher,
-            )?;
+            let action = run_app(&mut terminal, &mut app, &mut file_watcher)?;
 
             // Handle the action
             match action {
@@ -188,8 +138,6 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                     )?;
                     terminal.show_cursor()?;
 
-                    log_capture.set_message(format!("Opening shell at: {}", path.display()));
-
                     // Use $SHELL or try to detect the actual parent shell
                     let shell = std::env::var("SHELL").unwrap_or_else(|_| {
                         detect_parent_shell().unwrap_or_else(|| "/bin/sh".to_string())
@@ -204,180 +152,118 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                     break;
                 }
                 Action::DropToLibrary(repo_paths) => {
-                    use crate::RepoPattern;
-
-                    let mut success_count = 0;
-                    let mut error_count = 0;
-
-                    for repo_path in &repo_paths {
-                        // Mark as dropping
-                        app.update_repo_status(repo_path, tree::RepoOperationStatus::Dropping);
-                        terminal.draw(|f| ui(f, &mut app))?;
-
-                        // Small delay so user can see the status change
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-
-                        let pattern: RepoPattern = match repo_path.parse() {
-                            Ok(p) => p,
-                            Err(e) => {
-                                app.update_repo_status(
-                                    repo_path,
-                                    tree::RepoOperationStatus::Failed(format!(
-                                        "Parse error: {}",
-                                        e
-                                    )),
-                                );
-                                terminal.draw(|f| ui(f, &mut app))?;
-                                error_count += 1;
-                                continue;
-                            }
-                        };
-
-                        match workspace.drop(&pattern, false, false) {
-                            Ok(_) => {
-                                app.update_repo_status(
-                                    repo_path,
-                                    tree::RepoOperationStatus::Success,
-                                );
-                                success_count += 1;
-                            }
-                            Err(e) => {
-                                app.update_repo_status(
-                                    repo_path,
-                                    tree::RepoOperationStatus::Failed(e.to_string()),
-                                );
-                                error_count += 1;
-                            }
-                        }
-                        terminal.draw(|f| ui(f, &mut app))?;
-                    }
-
-                    // Set final message
-                    if error_count == 0 {
-                        log_capture
-                            .set_message(format!("Dropped {} repo(s) to library", success_count));
-                    } else {
-                        log_capture.set_message(format!(
-                            "Dropped {} repo(s), {} failed",
-                            success_count, error_count
-                        ));
-                    }
-
-                    // Wait a moment for user to see the result
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-
-                    // Reload repository data and rebuild the app state
-                    let workspace_repos = collect_workspace_repos(workspace, &log_capture);
-                    let library_repos = collect_library_repos(workspace, &log_capture);
-
-                    // Rebuild app with fresh data
-                    app = App::new(workspace_repos, library_repos);
-                    app.last_log_message = log_capture.get_message();
+                    let message = run_repo_operation(
+                        &mut terminal,
+                        &mut app,
+                        &repo_paths,
+                        RepoOperationStatus::Dropping,
+                        |repo_path| {
+                            let Ok(pattern) = repo_path.parse::<RepoPattern>();
+                            workspace.drop(&pattern, false, false)
+                        },
+                        "Dropped",
+                    )?;
+                    reload_app(workspace, &mut app, message);
                 }
                 Action::RestoreFromLibrary(repo_paths) => {
-                    let mut success_count = 0;
-                    let mut error_count = 0;
-
-                    for repo_path in &repo_paths {
-                        // Mark as restoring
-                        app.update_repo_status(repo_path, tree::RepoOperationStatus::Restoring);
-                        terminal.draw(|f| ui(f, &mut app))?;
-
-                        // Small delay so user can see the status change
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-
-                        let result = workspace.restore_from_library(repo_path);
-
-                        match result {
-                            Ok(_) => {
-                                app.update_repo_status(
-                                    repo_path,
-                                    tree::RepoOperationStatus::Success,
-                                );
-                                success_count += 1;
-                            }
-                            Err(e) => {
-                                app.update_repo_status(
-                                    repo_path,
-                                    tree::RepoOperationStatus::Failed(e.to_string()),
-                                );
-                                error_count += 1;
-                            }
-                        }
-                        terminal.draw(|f| ui(f, &mut app))?;
-                    }
-
-                    // Set final message
-                    if error_count == 0 {
-                        log_capture.set_message(format!(
-                            "Restored {} repo(s) from library",
-                            success_count
-                        ));
-                    } else {
-                        log_capture.set_message(format!(
-                            "Restored {} repo(s), {} failed",
-                            success_count, error_count
-                        ));
-                    }
-
-                    // Wait a moment for user to see the result
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-
-                    // Reload repository data and rebuild the app state
-                    let workspace_repos = collect_workspace_repos(workspace, &log_capture);
-                    let library_repos = collect_library_repos(workspace, &log_capture);
-
-                    // Rebuild app with fresh data
-                    app = App::new(workspace_repos, library_repos);
-                    app.last_log_message = log_capture.get_message();
+                    let message = run_repo_operation(
+                        &mut terminal,
+                        &mut app,
+                        &repo_paths,
+                        RepoOperationStatus::Restoring,
+                        |repo_path| workspace.restore_from_library(repo_path),
+                        "Restored",
+                    )?;
+                    reload_app(workspace, &mut app, message);
                 }
                 Action::CloneRepo(repo_pattern) => {
-                    use crate::RepoPattern;
-
-                    log_capture.set_message(format!("Cloning repository {}...", repo_pattern));
+                    app.last_log_message = format!("Cloning repository {}...", repo_pattern);
                     // Force a redraw to show the message immediately
-                    app.last_log_message = log_capture.get_message();
                     terminal.draw(|f| ui(f, &mut app))?;
 
-                    let pattern: RepoPattern = repo_pattern
-                        .parse()
-                        .map_err(|e| anyhow::anyhow!("Failed to parse pattern: {}", e))?;
+                    let Ok(pattern) = repo_pattern.parse::<RepoPattern>();
 
                     // Clone the repository
-                    match workspace.open(&pattern) {
-                        Ok(_) => {
-                            log_capture.set_message(format!("Cloned repository {}", repo_pattern))
-                        }
-                        Err(e) => log_capture.set_message(format!("Failed to clone: {}", e)),
-                    }
+                    app.last_log_message = match workspace.open(&pattern) {
+                        Ok(_) => format!("Cloned repository {}", repo_pattern),
+                        Err(e) => format!("Failed to clone: {}", e),
+                    };
                 }
                 Action::RefreshData => {
                     // Filesystem changed - reload repository data
-                    let workspace_repos = collect_workspace_repos(workspace, &log_capture);
-                    let library_repos = collect_library_repos(workspace, &log_capture);
-
-                    // Rebuild app with fresh data
-                    app = App::new(workspace_repos, library_repos);
-                    app.last_log_message = log_capture.get_message();
+                    let message = std::mem::take(&mut app.last_log_message);
+                    reload_app(workspace, &mut app, message);
 
                     // Drain events generated by the refresh to prevent feedback loop
                     file_watcher.drain_pending();
                 }
-            } // End of action match
-        } // End of inner loop
-    } // End of outer loop
+            }
+        }
+    }
+}
+
+/// Run a drop/restore operation over the given repos, updating each repo's
+/// status in the UI as it progresses. Returns the summary message.
+fn run_repo_operation<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    repo_paths: &[String],
+    in_progress: RepoOperationStatus,
+    mut operation: impl FnMut(&str) -> Result<()>,
+    verb: &str,
+) -> Result<String> {
+    let mut success_count = 0;
+    let mut error_count = 0;
+    let draw = |terminal: &mut Terminal<B>, app: &mut App| -> Result<()> {
+        terminal
+            .draw(|f| ui(f, app))
+            .map_err(|e| anyhow!("Failed to render frame: {}", e))?;
+        Ok(())
+    };
+
+    for repo_path in repo_paths {
+        app.update_repo_status(repo_path, in_progress.clone());
+        draw(terminal, app)?;
+
+        // Small delay so user can see the status change
+        std::thread::sleep(Duration::from_millis(100));
+
+        match operation(repo_path) {
+            Ok(_) => {
+                app.update_repo_status(repo_path, RepoOperationStatus::Success);
+                success_count += 1;
+            }
+            Err(e) => {
+                app.update_repo_status(repo_path, RepoOperationStatus::Failed(e.to_string()));
+                error_count += 1;
+            }
+        }
+        draw(terminal, app)?;
+    }
+
+    // Wait a moment for user to see the result
+    std::thread::sleep(Duration::from_millis(500));
+
+    Ok(if error_count == 0 {
+        format!("{} {} repo(s)", verb, success_count)
+    } else {
+        format!("{} {} repo(s), {} failed", verb, success_count, error_count)
+    })
+}
+
+/// Reload repository data and rebuild the app state
+fn reload_app(workspace: &Workspace, app: &mut App, message: String) {
+    let (workspace_repos, library_repos) = collect_repos(workspace, |_, _, _| {});
+    *app = App::new(workspace_repos, library_repos);
+    app.last_log_message = message;
 }
 
 fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
-    log_capture: LogCapture,
     file_watcher: &mut FileWatcher,
 ) -> Result<Action> {
     loop {
-        // Update the app with the latest log message
-        app.last_log_message = log_capture.get_message();
-
         terminal
             .draw(|f| ui(f, app))
             .map_err(|e| anyhow!("Failed to render frame: {}", e))?;
@@ -389,214 +275,156 @@ fn run_app<B: ratatui::backend::Backend>(
 
         // Use poll with timeout to allow checking for filesystem updates periodically
         if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Key(key) => match app.mode {
-                    AppMode::Normal => match key.code {
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            return Ok(Action::None);
-                        }
-                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            // Ctrl+D = drop workspace repo(s) to library
-                            if app.active_section == Section::Workspace
-                                && let Some(node) = app.selected_workspace_node()
-                            {
-                                let repo_paths = node.collect_repo_paths();
-                                if !repo_paths.is_empty() {
-                                    return Ok(Action::DropToLibrary(repo_paths));
-                                }
+            // Ignore other event types (Mouse, Resize, etc.)
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            match app.mode {
+                AppMode::Normal => match key.code {
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(Action::None);
+                    }
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Ctrl+D = drop workspace repo(s) to library
+                        if app.active_section == Section::Workspace
+                            && let Some(node) = app.selected_node()
+                        {
+                            let repo_paths = node.collect_repo_paths();
+                            if !repo_paths.is_empty() {
+                                return Ok(Action::DropToLibrary(repo_paths));
                             }
                         }
-                        KeyCode::Right => {
-                            // Right arrow = expand node
-                            app.toggle_expand();
-                        }
-                        KeyCode::Left => {
-                            // Left arrow = collapse node
-                            app.toggle_expand();
-                        }
-                        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            // Ctrl+A = clone repo dialog
-                            app.mode = AppMode::CloneRepo;
-                            app.clone_repo_input.clear();
+                    }
+                    KeyCode::Right | KeyCode::Left => {
+                        app.toggle_expand();
+                    }
+                    KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // Ctrl+A = clone repo dialog
+                        app.mode = AppMode::CloneRepo;
+                        app.clone_repo_input.clear();
 
-                            // Fetch suggestions in background (blocking for now)
-                            let mut suggestions = Vec::new();
-                            suggestions.extend(get_github_suggestions());
-                            suggestions.extend(get_gitlab_suggestions());
-                            suggestions.sort();
-                            suggestions.dedup();
+                        // Fetch suggestions in background (blocking for now)
+                        let mut suggestions = Vec::new();
+                        suggestions.extend(get_github_suggestions());
+                        suggestions.extend(get_gitlab_suggestions());
+                        suggestions.sort();
+                        suggestions.dedup();
 
-                            // Filter out repos that already exist in workspace or library
-                            let existing_repos: std::collections::HashSet<String> = app
-                                .get_flattened_workspace()
-                                .iter()
-                                .chain(app.get_flattened_library().iter())
-                                .filter_map(|(node, _, _, _)| {
-                                    node.repo_info.as_ref().map(|r| r.display_name.clone())
-                                })
-                                .collect();
+                        // Filter out repos that already exist in workspace or library
+                        let existing_repos: std::collections::HashSet<String> = app
+                            .get_flattened_workspace()
+                            .iter()
+                            .chain(app.get_flattened_library().iter())
+                            .filter_map(|(node, _, _, _)| {
+                                node.repo_info.as_ref().map(|r| r.display_name.clone())
+                            })
+                            .collect();
 
-                            suggestions.retain(|s| {
-                                // Extract the repo name from the suggestion (e.g., "github.com/user/repo" -> "github.com/user/repo")
-                                !existing_repos.contains(s)
-                            });
+                        suggestions.retain(|s| !existing_repos.contains(s));
 
-                            app.clone_repo_suggestions = suggestions;
+                        app.clone_repo_suggestions = suggestions;
 
-                            if !app.clone_repo_suggestions.is_empty() {
-                                app.clone_repo_state.select(Some(0));
-                            }
-                        }
-                        KeyCode::Esc => {
-                            // Return None to exit - cleanup happens in the outer loop
-                            return Ok(Action::None);
-                        }
-                        KeyCode::Tab => {
-                            // Tab switches between workspace and library
-                            match app.active_section {
-                                Section::Workspace => {
-                                    let library_items = app.get_flattened_library();
-                                    if !library_items.is_empty() {
-                                        app.workspace_state.select(None);
-                                        app.library_state.select(Some(0));
-                                        app.active_section = Section::Library;
-                                    }
-                                }
-                                Section::Library => {
-                                    let workspace_items = app.get_flattened_workspace();
-                                    if !workspace_items.is_empty() {
-                                        app.library_state.select(None);
-                                        app.workspace_state.select(Some(0));
-                                        app.active_section = Section::Workspace;
-                                    }
-                                }
-                            }
-                        }
-                        KeyCode::Down => app.next(),
-                        KeyCode::Up => app.previous(),
-                        KeyCode::Enter => {
-                            // Enter on workspace repo = open shell
-                            // Enter on library repo = restore from library
-                            return Ok(match app.active_section {
-                                Section::Workspace => {
-                                    if let Some(node) = app.selected_workspace_node() {
-                                        if let Some(repo) = node.repo_info {
-                                            Action::OpenShell(repo.path.clone())
-                                        } else {
-                                            // Just a directory node, toggle expand
-                                            app.toggle_expand();
-                                            Action::None
-                                        }
-                                    } else {
-                                        Action::None
-                                    }
-                                }
-                                Section::Library => {
-                                    if let Some(node) = app.selected_library_node() {
-                                        let repo_paths = node.collect_repo_paths();
-                                        if !repo_paths.is_empty() {
-                                            Action::RestoreFromLibrary(repo_paths)
-                                        } else {
-                                            // Just a directory node, toggle expand
-                                            app.toggle_expand();
-                                            Action::None
-                                        }
-                                    } else {
-                                        Action::None
-                                    }
-                                }
-                            });
-                        }
-                        KeyCode::Char(c) => {
-                            app.search_query.push(c);
-                            app.filter_repos();
-                        }
-                        KeyCode::Backspace => {
-                            app.search_query.pop();
-                            app.filter_repos();
-                        }
-                        _ => {}
-                    },
-                    AppMode::CloneRepo => match key.code {
-                        KeyCode::Esc => {
-                            app.mode = AppMode::Normal;
-                            app.clone_repo_input.clear();
-                        }
-                        KeyCode::Enter => {
-                            // Use selected suggestion or manual input
-                            let repo = if let Some(idx) = app.clone_repo_state.selected() {
-                                // Filter suggestions by current input
-                                let filtered: Vec<_> = app
-                                    .clone_repo_suggestions
-                                    .iter()
-                                    .filter(|s| {
-                                        s.to_lowercase()
-                                            .contains(&app.clone_repo_input.to_lowercase())
-                                    })
-                                    .collect();
-
-                                filtered.get(idx).map(|s| (*s).to_string())
-                            } else {
-                                None
-                            };
-
-                            let repo = repo.unwrap_or_else(|| app.clone_repo_input.clone());
-
-                            if !repo.is_empty() {
-                                app.mode = AppMode::Normal;
-                                return Ok(Action::CloneRepo(repo));
-                            }
-                        }
-                        KeyCode::Down => {
-                            let filtered: Vec<_> = app
-                                .clone_repo_suggestions
-                                .iter()
-                                .filter(|s| {
-                                    s.to_lowercase()
-                                        .contains(&app.clone_repo_input.to_lowercase())
-                                })
-                                .collect();
-
-                            if !filtered.is_empty() {
-                                let next = match app.clone_repo_state.selected() {
-                                    Some(i) if i >= filtered.len() - 1 => 0,
-                                    Some(i) => i + 1,
-                                    None => 0,
-                                };
-                                app.clone_repo_state.select(Some(next));
-                            }
-                        }
-                        KeyCode::Up => {
-                            let filtered: Vec<_> = app
-                                .clone_repo_suggestions
-                                .iter()
-                                .filter(|s| {
-                                    s.to_lowercase()
-                                        .contains(&app.clone_repo_input.to_lowercase())
-                                })
-                                .collect();
-
-                            if !filtered.is_empty() {
-                                let prev = match app.clone_repo_state.selected() {
-                                    Some(0) => filtered.len() - 1,
-                                    Some(i) => i - 1,
-                                    None => 0,
-                                };
-                                app.clone_repo_state.select(Some(prev));
-                            }
-                        }
-                        KeyCode::Char(c) => {
-                            app.clone_repo_input.push(c);
+                        if !app.clone_repo_suggestions.is_empty() {
                             app.clone_repo_state.select(Some(0));
                         }
-                        KeyCode::Backspace => {
-                            app.clone_repo_input.pop();
+                    }
+                    KeyCode::Esc => {
+                        // Return None to exit - cleanup happens in the outer loop
+                        return Ok(Action::None);
+                    }
+                    KeyCode::Tab => {
+                        // Tab switches between workspace and library
+                        app.switch_section();
+                    }
+                    KeyCode::Down => app.next(),
+                    KeyCode::Up => app.previous(),
+                    KeyCode::Enter => {
+                        // Enter on workspace repo = open shell
+                        // Enter on library repo = restore from library
+                        // Enter on a directory node = toggle expansion
+                        let selected = app.selected_node().map(|node| {
+                            (
+                                node.repo_info.as_ref().map(|r| r.path.clone()),
+                                node.collect_repo_paths(),
+                            )
+                        });
+
+                        if let Some((repo_dir, repo_paths)) = selected {
+                            match app.active_section {
+                                Section::Workspace => match repo_dir {
+                                    Some(path) => return Ok(Action::OpenShell(path)),
+                                    None => app.toggle_expand(),
+                                },
+                                Section::Library => {
+                                    if !repo_paths.is_empty() {
+                                        return Ok(Action::RestoreFromLibrary(repo_paths));
+                                    }
+                                    app.toggle_expand();
+                                }
+                            }
                         }
-                        _ => {}
-                    },
+                    }
+                    KeyCode::Char(c) => {
+                        app.search_query.push(c);
+                        app.filter_repos();
+                    }
+                    KeyCode::Backspace => {
+                        app.search_query.pop();
+                        app.filter_repos();
+                    }
+                    _ => {}
                 },
-                // Ignore other event types (Mouse, Resize, etc.)
-                _ => {}
+                AppMode::CloneRepo => match key.code {
+                    KeyCode::Esc => {
+                        app.mode = AppMode::Normal;
+                        app.clone_repo_input.clear();
+                    }
+                    KeyCode::Enter => {
+                        // Use selected suggestion or manual input
+                        let repo = app
+                            .clone_repo_state
+                            .selected()
+                            .and_then(|idx| {
+                                app.filtered_suggestions().get(idx).map(|s| s.to_string())
+                            })
+                            .unwrap_or_else(|| app.clone_repo_input.clone());
+
+                        if !repo.is_empty() {
+                            app.mode = AppMode::Normal;
+                            return Ok(Action::CloneRepo(repo));
+                        }
+                    }
+                    KeyCode::Down => {
+                        let len = app.filtered_suggestions().len();
+                        if len > 0 {
+                            let next = match app.clone_repo_state.selected() {
+                                Some(i) if i + 1 >= len => 0,
+                                Some(i) => i + 1,
+                                None => 0,
+                            };
+                            app.clone_repo_state.select(Some(next));
+                        }
+                    }
+                    KeyCode::Up => {
+                        let len = app.filtered_suggestions().len();
+                        if len > 0 {
+                            let prev = match app.clone_repo_state.selected() {
+                                Some(0) => len - 1,
+                                Some(i) => i - 1,
+                                None => 0,
+                            };
+                            app.clone_repo_state.select(Some(prev));
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        app.clone_repo_input.push(c);
+                        app.clone_repo_state.select(Some(0));
+                    }
+                    KeyCode::Backspace => {
+                        app.clone_repo_input.pop();
+                    }
+                    _ => {}
+                },
             }
         }
     }
@@ -628,394 +456,13 @@ fn ui(f: &mut Frame, app: &mut App) {
         ])
         .split(vertical_chunks[1]);
 
-    // Help text (at top)
-    let help_spans = if app.active_section == Section::Workspace {
-        vec![
-            Span::styled(
-                "Tab",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" switch  "),
-            Span::styled(
-                "↑/↓",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" navigate  "),
-            Span::styled(
-                "←/→",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" expand/collapse  "),
-            Span::styled(
-                "Enter",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" open  "),
-            Span::styled(
-                "Ctrl+D",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" drop  "),
-            Span::styled(
-                "Ctrl+A",
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" clone  "),
-            Span::styled(
-                "Esc",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" quit"),
-        ]
-    } else if app.active_section == Section::Library {
-        vec![
-            Span::styled(
-                "Tab",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" switch  "),
-            Span::styled(
-                "↑/↓",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" navigate  "),
-            Span::styled(
-                "←/→",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" expand/collapse  "),
-            Span::styled(
-                "Enter",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" restore  "),
-            Span::styled(
-                "Ctrl+A",
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" clone  "),
-            Span::styled(
-                "Esc",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" quit"),
-        ]
-    } else {
-        vec![
-            Span::styled(
-                "Esc",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" quit"),
-        ]
-    };
-    let help = Paragraph::new(Line::from(help_spans)).alignment(Alignment::Center);
-    f.render_widget(help, vertical_chunks[0]);
-
-    // Calculate available width for workspace panel (minus borders and padding)
-    // Account for: 2 for borders, 2 for highlight symbol ">> ", 1 for padding on right
-    let workspace_width = horizontal_chunks[0].width.saturating_sub(5) as usize;
-
-    // Workspace repositories (tree)
-    let workspace_flat = app.get_flattened_workspace();
-    let workspace_items: Vec<ListItem> = workspace_flat
-        .iter()
-        .map(|(node, depth, _, full_path)| {
-            let mut spans = vec![];
-
-            // Add tree structure indicators
-            if *depth > 0 {
-                spans.push(Span::raw("  ".repeat(*depth)));
-            }
-
-            // Add expand/collapse indicator
-            if !node.children.is_empty() {
-                let is_git_submodule = node
-                    .repo_info
-                    .as_ref()
-                    .map(|r| r.is_submodule)
-                    .unwrap_or(false);
-                let indicator = if is_git_submodule {
-                    if node.expanded { "◇ " } else { "◆ " }
-                } else {
-                    if node.expanded { "▼ " } else { "▶ " }
-                };
-                spans.push(Span::styled(indicator, Style::default().fg(Color::Cyan)));
-            } else if *depth > 0 {
-                spans.push(Span::raw("  "));
-            }
-
-            // Add status icon for repos only
-            if let Some(ref repo) = node.repo_info {
-                if repo.is_submodule {
-                    // Submodule indicator
-                    if repo.submodule_initialized {
-                        spans.push(Span::styled("S ", Style::default().fg(Color::Magenta)));
-                    } else {
-                        spans.push(Span::styled("S ", Style::default().fg(Color::DarkGray)));
-                        spans.push(Span::styled(
-                            "(uninit) ",
-                            Style::default().fg(Color::DarkGray),
-                        ));
-                    }
-                } else {
-                    // Regular repo status
-                    if repo.is_clean {
-                        spans.push(Span::styled("✓ ", Style::default().fg(Color::Green)));
-                    } else {
-                        spans.push(Span::styled("* ", Style::default().fg(Color::Yellow)));
-                    }
-                }
-            }
-
-            // Add name with search highlighting
-            if !app.search_query.is_empty() {
-                // For directory nodes, check if the search query contains this directory as a path component
-                let should_highlight_dir = node.repo_info.is_none()
-                    && app.search_query.contains(&format!("{}/", node.name));
-
-                // Try to match against the full path for this node
-                let indices = if should_highlight_dir
-                    || app
-                        .matcher
-                        .fuzzy_indices(full_path, &app.search_query)
-                        .is_some()
-                {
-                    app.matcher
-                        .fuzzy_indices(full_path, &app.search_query)
-                        .map(|(_, idx)| idx)
-                } else {
-                    None
-                };
-
-                spans.extend(render_highlighted_name(
-                    &node.name,
-                    full_path,
-                    should_highlight_dir,
-                    indices,
-                ));
-            } else {
-                spans.push(Span::raw(&node.name));
-            }
-
-            // Calculate current text width (accounting for unicode characters)
-            let mut text_width = 0;
-            for span in &spans {
-                text_width += span.content.chars().count();
-            }
-
-            // Add operation status or modification time for workspace repos
-            if let Some(ref repo) = node.repo_info {
-                let (status_text, status_color) = match &repo.operation_status {
-                    tree::RepoOperationStatus::None => {
-                        // Show modification time if available
-                        if let Some(mod_time) = repo.modification_time {
-                            (format_time_ago_verbose(mod_time), Color::DarkGray)
-                        } else {
-                            (String::new(), Color::DarkGray)
-                        }
-                    }
-                    tree::RepoOperationStatus::Dropping => {
-                        ("dropping...".to_string(), Color::Yellow)
-                    }
-                    tree::RepoOperationStatus::Restoring => {
-                        ("restoring...".to_string(), Color::Cyan)
-                    }
-                    tree::RepoOperationStatus::Success => ("done".to_string(), Color::Green),
-                    tree::RepoOperationStatus::Failed(err) => {
-                        (format!("failed: {}", err), Color::Red)
-                    }
-                };
-
-                spans.extend(render_metadata_span(
-                    text_width,
-                    workspace_width,
-                    status_text,
-                    status_color,
-                ));
-            }
-
-            ListItem::new(Line::from(spans))
-        })
-        .collect();
-
-    let workspace_repo_count = app.count_workspace_repos();
-    let workspace_list = List::new(workspace_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!("Workspace ({})", workspace_repo_count))
-                .border_style(if app.active_section == Section::Workspace {
-                    Style::default().fg(Color::Cyan)
-                } else {
-                    Style::default()
-                }),
-        )
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol(">> ");
-
-    // Create a custom state wrapper for rendering
-    let mut ws_list_state = ratatui::widgets::ListState::default();
-    ws_list_state.select(app.workspace_state.selected());
-    f.render_stateful_widget(workspace_list, horizontal_chunks[0], &mut ws_list_state);
-
-    // Calculate available width for library panel (minus borders and padding)
-    // Account for: 2 for borders, 2 for highlight symbol ">> ", 1 for padding on right
-    let library_width = horizontal_chunks[1].width.saturating_sub(5) as usize;
-
-    // Library repositories (tree)
-    let library_flat = app.get_flattened_library();
-    let library_items: Vec<ListItem> = library_flat
-        .iter()
-        .map(|(node, depth, _, full_path)| {
-            let mut spans = vec![];
-
-            // Add tree structure indicators
-            if *depth > 0 {
-                spans.push(Span::raw("  ".repeat(*depth)));
-            }
-
-            // Add expand/collapse indicator
-            if !node.children.is_empty() {
-                spans.push(Span::styled(
-                    if node.expanded { "▼ " } else { "▶ " },
-                    Style::default().fg(Color::Cyan),
-                ));
-            } else if *depth > 0 {
-                spans.push(Span::raw("  "));
-            }
-
-            // No icons for library items
-
-            // Add name with search highlighting
-            if !app.search_query.is_empty() {
-                // For directory nodes, check if the search query contains this directory as a path component
-                let should_highlight_dir = node.repo_info.is_none()
-                    && app.search_query.contains(&format!("{}/", node.name));
-
-                // Try to match against the full path for this node
-                let indices = if should_highlight_dir
-                    || app
-                        .matcher
-                        .fuzzy_indices(full_path, &app.search_query)
-                        .is_some()
-                {
-                    app.matcher
-                        .fuzzy_indices(full_path, &app.search_query)
-                        .map(|(_, idx)| idx)
-                } else {
-                    None
-                };
-
-                spans.extend(render_highlighted_name(
-                    &node.name,
-                    full_path,
-                    should_highlight_dir,
-                    indices,
-                ));
-            } else {
-                spans.push(Span::raw(&node.name));
-            }
-
-            // Calculate current text width (accounting for unicode characters)
-            let mut text_width = 0;
-            for span in &spans {
-                text_width += span.content.chars().count();
-            }
-
-            // Add operation status or size for library repos
-            if let Some(ref repo) = node.repo_info {
-                let (status_text, status_color) = match &repo.operation_status {
-                    tree::RepoOperationStatus::None => {
-                        // Show size if available
-                        if let Some(size_bytes) = repo.size_bytes {
-                            (format_size(size_bytes), Color::DarkGray)
-                        } else {
-                            (String::new(), Color::DarkGray)
-                        }
-                    }
-                    tree::RepoOperationStatus::Dropping => {
-                        ("dropping...".to_string(), Color::Yellow)
-                    }
-                    tree::RepoOperationStatus::Restoring => {
-                        ("restoring...".to_string(), Color::Cyan)
-                    }
-                    tree::RepoOperationStatus::Success => ("done".to_string(), Color::Green),
-                    tree::RepoOperationStatus::Failed(err) => {
-                        (format!("failed: {}", err), Color::Red)
-                    }
-                };
-
-                spans.extend(render_metadata_span(
-                    text_width,
-                    library_width,
-                    status_text,
-                    status_color,
-                ));
-            }
-
-            ListItem::new(Line::from(spans))
-        })
-        .collect();
-
-    let library_repo_count = app.count_library_repos();
-    let library_list = List::new(library_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!("Library ({})", library_repo_count))
-                .border_style(if app.active_section == Section::Library {
-                    Style::default().fg(Color::Cyan)
-                } else {
-                    Style::default()
-                }),
-        )
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol(">> ");
-
-    // Create a custom state wrapper for rendering
-    let mut lib_list_state = ratatui::widgets::ListState::default();
-    lib_list_state.select(app.library_state.selected());
-    f.render_stateful_widget(library_list, horizontal_chunks[1], &mut lib_list_state);
+    render_help_line(f, app, vertical_chunks[0]);
+    render_tree_panel(f, app, horizontal_chunks[0], Section::Workspace);
+    render_tree_panel(f, app, horizontal_chunks[1], Section::Library);
 
     // Search box
     let search_text = format!("{}_", app.search_query);
     let search_style = if app.search_query.is_empty() {
-        Style::default()
-    } else {
-        Style::default().fg(Color::Yellow)
-    };
-    let search_border_style = if app.search_query.is_empty() {
         Style::default()
     } else {
         Style::default().fg(Color::Yellow)
@@ -1026,7 +473,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(search_border_style)
+                .border_style(search_style)
                 .title("Search"),
         );
     f.render_widget(search, vertical_chunks[2]);
@@ -1038,19 +485,215 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(status, vertical_chunks[3]);
 }
 
-fn render_clone_repo_dialog(f: &mut Frame, app: &App) {
-    use ratatui::layout::Rect;
+/// Render the key-binding help line at the top of the screen
+fn render_help_line(f: &mut Frame, app: &App, area: Rect) {
+    let enter_action = match app.active_section {
+        Section::Workspace => " open  ",
+        Section::Library => " restore  ",
+    };
 
+    let mut bindings: Vec<(&str, Color, &str)> = vec![
+        ("Tab", Color::Cyan, " switch  "),
+        ("↑/↓", Color::Cyan, " navigate  "),
+        ("←/→", Color::Cyan, " expand/collapse  "),
+        ("Enter", Color::Green, enter_action),
+    ];
+    if app.active_section == Section::Workspace {
+        bindings.push(("Ctrl+D", Color::Yellow, " drop  "));
+    }
+    bindings.push(("Ctrl+A", Color::Magenta, " clone  "));
+    bindings.push(("Esc", Color::Red, " quit"));
+
+    let mut help_spans = Vec::new();
+    for (key, color, description) in bindings {
+        help_spans.push(Span::styled(
+            key,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+        help_spans.push(Span::raw(description));
+    }
+
+    let help = Paragraph::new(Line::from(help_spans)).alignment(Alignment::Center);
+    f.render_widget(help, area);
+}
+
+/// Render the workspace or library tree panel
+fn render_tree_panel(f: &mut Frame, app: &App, area: Rect, section: Section) {
+    // Account for: 2 for borders, 2 for highlight symbol ">> ", 1 for padding on right
+    let available_width = area.width.saturating_sub(5) as usize;
+
+    // Workspace repos show status icons and modification time; library repos show size
+    type IdleMetadata = fn(&RepoInfo) -> String;
+    let (items, state, title, show_status_icons, idle_metadata) = match section {
+        Section::Workspace => (
+            app.get_flattened_workspace(),
+            &app.workspace_state,
+            format!("Workspace ({})", app.count_workspace_repos()),
+            true,
+            (|repo| {
+                repo.modification_time
+                    .map(format_time_ago_verbose)
+                    .unwrap_or_default()
+            }) as IdleMetadata,
+        ),
+        Section::Library => (
+            app.get_flattened_library(),
+            &app.library_state,
+            format!("Library ({})", app.count_library_repos()),
+            false,
+            (|repo| repo.size_bytes.map(format_size).unwrap_or_default()) as IdleMetadata,
+        ),
+    };
+
+    let list_items: Vec<ListItem> = items
+        .iter()
+        .map(|(node, depth, _, full_path)| {
+            tree_list_item(
+                node,
+                *depth,
+                full_path,
+                app,
+                available_width,
+                show_status_icons,
+                idle_metadata,
+            )
+        })
+        .collect();
+
+    let list = List::new(list_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(if app.active_section == section {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default()
+                }),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ");
+
+    // Create a custom state wrapper for rendering
+    let mut list_state = ratatui::widgets::ListState::default();
+    list_state.select(state.selected());
+    f.render_stateful_widget(list, area, &mut list_state);
+}
+
+/// Render a single tree node as a list item
+fn tree_list_item<'a>(
+    node: &'a TreeNode,
+    depth: usize,
+    full_path: &str,
+    app: &App,
+    available_width: usize,
+    show_status_icons: bool,
+    idle_metadata: fn(&RepoInfo) -> String,
+) -> ListItem<'a> {
+    let mut spans = vec![];
+
+    // Add tree structure indicators
+    if depth > 0 {
+        spans.push(Span::raw("  ".repeat(depth)));
+    }
+
+    // Add expand/collapse indicator
+    if !node.children.is_empty() {
+        let is_git_submodule = node
+            .repo_info
+            .as_ref()
+            .map(|r| r.is_submodule)
+            .unwrap_or(false);
+        let indicator = match (is_git_submodule, node.expanded) {
+            (true, true) => "◇ ",
+            (true, false) => "◆ ",
+            (false, true) => "▼ ",
+            (false, false) => "▶ ",
+        };
+        spans.push(Span::styled(indicator, Style::default().fg(Color::Cyan)));
+    } else if depth > 0 {
+        spans.push(Span::raw("  "));
+    }
+
+    // Add status icon for repos only
+    if show_status_icons && let Some(ref repo) = node.repo_info {
+        if repo.is_submodule {
+            // Submodule indicator
+            if repo.submodule_initialized {
+                spans.push(Span::styled("S ", Style::default().fg(Color::Magenta)));
+            } else {
+                spans.push(Span::styled("S ", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    "(uninit) ",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        } else if repo.is_clean {
+            spans.push(Span::styled("✓ ", Style::default().fg(Color::Green)));
+        } else {
+            spans.push(Span::styled("* ", Style::default().fg(Color::Yellow)));
+        }
+    }
+
+    // Add name with search highlighting
+    if !app.search_query.is_empty() {
+        // For directory nodes, check if the search query contains this directory as a path component
+        let should_highlight_dir =
+            node.repo_info.is_none() && app.search_query.contains(&format!("{}/", node.name));
+
+        // Try to match against the full path for this node
+        let indices = app
+            .matcher
+            .fuzzy_indices(full_path, &app.search_query)
+            .map(|(_, indices)| indices);
+
+        spans.extend(render_highlighted_name(
+            &node.name,
+            full_path,
+            should_highlight_dir,
+            indices,
+        ));
+    } else {
+        spans.push(Span::raw(&node.name));
+    }
+
+    // Add right-aligned operation status or idle metadata for repos
+    if let Some(ref repo) = node.repo_info {
+        // Current text width (accounting for unicode characters)
+        let text_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+
+        let (status_text, status_color) = match &repo.operation_status {
+            RepoOperationStatus::None => (idle_metadata(repo), Color::DarkGray),
+            RepoOperationStatus::Dropping => ("dropping...".to_string(), Color::Yellow),
+            RepoOperationStatus::Restoring => ("restoring...".to_string(), Color::Cyan),
+            RepoOperationStatus::Success => ("done".to_string(), Color::Green),
+            RepoOperationStatus::Failed(err) => (format!("failed: {}", err), Color::Red),
+        };
+
+        spans.extend(render_metadata_span(
+            text_width,
+            available_width,
+            status_text,
+            status_color,
+        ));
+    }
+
+    ListItem::new(Line::from(spans))
+}
+
+fn render_clone_repo_dialog(f: &mut Frame, app: &App) {
     // Create a centered dialog
     let area = f.area();
     let dialog_width = area.width.min(80);
     let dialog_height = area.height.min(20);
-    let dialog_x = (area.width - dialog_width) / 2;
-    let dialog_y = (area.height - dialog_height) / 2;
 
     let dialog_area = Rect {
-        x: dialog_x,
-        y: dialog_y,
+        x: (area.width - dialog_width) / 2,
+        y: (area.height - dialog_height) / 2,
         width: dialog_width,
         height: dialog_height,
     };
@@ -1089,22 +732,10 @@ fn render_clone_repo_dialog(f: &mut Frame, app: &App) {
     f.render_widget(input, chunks[0]);
 
     // Suggestions list
-    let filtered_suggestions: Vec<_> = app
-        .clone_repo_suggestions
-        .iter()
-        .filter(|s| {
-            if app.clone_repo_input.is_empty() {
-                true
-            } else {
-                s.to_lowercase()
-                    .contains(&app.clone_repo_input.to_lowercase())
-            }
-        })
-        .collect();
-
+    let filtered_suggestions = app.filtered_suggestions();
     let suggestion_items: Vec<ListItem> = filtered_suggestions
         .iter()
-        .map(|s| ListItem::new(s.as_str()))
+        .map(|s| ListItem::new(*s))
         .collect();
 
     let suggestions = List::new(suggestion_items)
@@ -1220,255 +851,167 @@ fn render_highlighted_name<'a>(
     spans
 }
 
-/// Collect workspace repositories with metadata (with live UI updates)
-fn collect_workspace_repos_live<B: ratatui::backend::Backend>(
-    workspace: &Workspace,
-    log_capture: &LogCapture,
-    terminal: &mut Terminal<B>,
-    app: &mut App,
-    library_repos: &[RepoInfo],
-) -> Vec<RepoInfo> {
-    let repos = find_git_repositories(&workspace.path).unwrap_or_default();
-    let mut repo_infos = Vec::new();
-    let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let total_repos = repos.len();
+/// Scan a single workspace repository, returning it and any submodules
+fn scan_workspace_repo(workspace_path: &str, path: PathBuf) -> Vec<RepoInfo> {
+    let display_name = path
+        .strip_prefix(workspace_path)
+        .unwrap_or(&path)
+        .display()
+        .to_string()
+        .trim_start_matches('/')
+        .to_string();
 
-    for (idx, path) in repos.into_iter().enumerate() {
-        let display_name = path
-            .strip_prefix(&workspace.path)
-            .unwrap_or(&path)
-            .display()
-            .to_string()
-            .trim_start_matches('/')
-            .to_string();
+    // Check repo status and get modification time in a single repo open for performance
+    let (status, modification_time) = crate::check_repo_status_and_modification_time(&path)
+        .unwrap_or((crate::RepoStatus::NoCommits, None));
 
-        // Update progress with current repo being processed
-        let spinner = spinner_frames[idx % spinner_frames.len()];
-        log_capture.set_message(format!(
-            "{} Loading workspace: {} ({}/{})",
-            spinner,
-            display_name,
-            idx + 1,
-            total_repos
-        ));
-        app.last_log_message = log_capture.get_message();
+    // A repo is only clean if it has commits, no changes, and no unpushed commits
+    let is_clean = matches!(status, crate::RepoStatus::Clean);
 
-        // Check repo status and get modification time in a single repo open for performance
-        let (status, modification_time) = crate::check_repo_status_and_modification_time(&path)
-            .unwrap_or((crate::RepoStatus::NoCommits, None));
+    let mut infos = vec![RepoInfo {
+        path: path.clone(),
+        display_name: display_name.clone(),
+        is_clean,
+        modification_time,
+        size_bytes: None, // Size not computed for workspace repos to save time
+        operation_status: RepoOperationStatus::None,
+        is_submodule: false,
+        submodule_initialized: false,
+        parent_repo_path: None,
+    }];
 
-        // A repo is only clean if it has commits, no changes, and no unpushed commits
-        let is_clean = matches!(status, crate::RepoStatus::Clean);
+    // Find and add submodules
+    if let Ok(submodules) = crate::find_submodules_in_repo(&path) {
+        for submodule in submodules {
+            let submodule_display_name = if display_name.is_empty() {
+                submodule.path.display().to_string()
+            } else {
+                format!("{}/{}", display_name, submodule.path.display())
+            };
 
-        // Size not computed for workspace repos to save time
-        let size_bytes = None;
-
-        // Add the main repository
-        repo_infos.push(RepoInfo {
-            path: path.clone(),
-            display_name: display_name.clone(),
-            is_clean,
-            modification_time,
-            size_bytes,
-            operation_status: tree::RepoOperationStatus::None,
-            is_submodule: false,
-            submodule_initialized: false,
-            parent_repo_path: None,
-        });
-
-        // Update the app tree with current repos and redraw
-        app.update_repos(repo_infos.clone(), library_repos.to_vec());
-        let _ = terminal.draw(|f| ui(f, app));
-
-        // Find and add submodules
-        if let Ok(submodules) = crate::find_submodules_in_repo(&path) {
-            for (sub_idx, submodule) in submodules.iter().enumerate() {
-                let submodule_display_name = if display_name.is_empty() {
-                    submodule.path.display().to_string()
-                } else {
-                    format!("{}/{}", display_name, submodule.path.display())
-                };
-
-                // Update progress for submodule with spinner
-                let spinner = spinner_frames[(idx + sub_idx) % spinner_frames.len()];
-                log_capture.set_message(format!(
-                    "{} Loading submodule: {}",
-                    spinner, submodule_display_name
-                ));
-                app.last_log_message = log_capture.get_message();
-
-                repo_infos.push(RepoInfo {
-                    path: path.join(&submodule.path),
-                    display_name: submodule_display_name,
-                    is_clean: true, // Submodule status computed separately
-                    modification_time: None,
-                    size_bytes: None,
-                    operation_status: tree::RepoOperationStatus::None,
-                    is_submodule: true,
-                    submodule_initialized: submodule.initialized,
-                    parent_repo_path: Some(path.clone()),
-                });
-
-                // Update the app tree with current repos including submodule and redraw
-                app.update_repos(repo_infos.clone(), library_repos.to_vec());
-                let _ = terminal.draw(|f| ui(f, app));
-            }
+            infos.push(RepoInfo {
+                path: path.join(&submodule.path),
+                display_name: submodule_display_name,
+                is_clean: true, // Submodule status computed separately
+                modification_time: None,
+                size_bytes: None,
+                operation_status: RepoOperationStatus::None,
+                is_submodule: true,
+                submodule_initialized: submodule.initialized,
+                parent_repo_path: Some(path.clone()),
+            });
         }
     }
 
-    repo_infos
+    infos
 }
 
-/// Collect library repositories with metadata (with live UI updates)
-fn collect_library_repos_live<B: ratatui::backend::Backend>(
+/// Scan a single library repository for its metadata
+fn scan_library_repo(library_path: &str, repo_path: String) -> RepoInfo {
+    let full_path = PathBuf::from(library_path).join(&repo_path);
+    RepoInfo {
+        modification_time: get_repo_modification_time(&full_path).ok(),
+        size_bytes: get_repo_size(&full_path).ok(),
+        path: full_path,
+        display_name: repo_path,
+        is_clean: true, // Library repos are always clean
+        operation_status: RepoOperationStatus::None,
+        is_submodule: false,
+        submodule_initialized: false,
+        parent_repo_path: None,
+    }
+}
+
+/// Collect workspace and library repositories with metadata, scanning repos in
+/// parallel. `on_progress` is invoked on the calling thread as results arrive
+/// with a progress message and the repos collected so far.
+fn collect_repos(
     workspace: &Workspace,
-    log_capture: &LogCapture,
-    terminal: &mut Terminal<B>,
-    app: &mut App,
-    workspace_repos: &[RepoInfo],
-) -> Vec<RepoInfo> {
-    let library_repos = workspace.list_library().unwrap_or_default();
-    let mut repo_infos = Vec::new();
-    let spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let total_repos = library_repos.len();
-
-    for (idx, repo_path) in library_repos.into_iter().enumerate() {
-        // Update progress with current library repo being processed
-        let spinner = spinner_frames[idx % spinner_frames.len()];
-        log_capture.set_message(format!(
-            "{} Loading library: {} ({}/{})",
-            spinner,
-            repo_path,
-            idx + 1,
-            total_repos
-        ));
-        app.last_log_message = log_capture.get_message();
-
-        let full_path = PathBuf::from(&workspace.library_path()).join(&repo_path);
-        // Get modification time for library repos
-        let modification_time = get_repo_modification_time(&full_path, true).ok();
-        // Get size for library repos
-        let size_bytes = get_repo_size(&full_path).ok();
-
-        repo_infos.push(RepoInfo {
-            path: full_path,
-            display_name: repo_path,
-            is_clean: true, // Library repos are always clean
-            modification_time,
-            size_bytes,
-            operation_status: tree::RepoOperationStatus::None,
-            is_submodule: false,
-            submodule_initialized: false,
-            parent_repo_path: None,
-        });
-
-        // Update the app tree with current repos and redraw
-        app.update_repos(workspace_repos.to_vec(), repo_infos.clone());
-        let _ = terminal.draw(|f| ui(f, app));
+    mut on_progress: impl FnMut(&str, &[RepoInfo], &[RepoInfo]),
+) -> (Vec<RepoInfo>, Vec<RepoInfo>) {
+    enum ScanTask {
+        Workspace(PathBuf),
+        Library(String),
+    }
+    enum Scanned {
+        Workspace(Vec<RepoInfo>),
+        Library(RepoInfo),
     }
 
-    repo_infos
-}
+    let workspace_paths = find_git_repositories(Path::new(&workspace.path)).unwrap_or_default();
+    let library_paths = workspace.list_library().unwrap_or_default();
+    let library_path = workspace.library_path();
+    let total = workspace_paths.len() + library_paths.len();
 
-/// Collect workspace repositories with metadata (without UI updates - for reloads)
-fn collect_workspace_repos(workspace: &Workspace, log_capture: &LogCapture) -> Vec<RepoInfo> {
-    let repos = find_git_repositories(&workspace.path).unwrap_or_default();
-    let mut repo_infos = Vec::new();
+    let tasks: Mutex<Vec<ScanTask>> = Mutex::new(
+        workspace_paths
+            .into_iter()
+            .map(ScanTask::Workspace)
+            .chain(library_paths.into_iter().map(ScanTask::Library))
+            .collect(),
+    );
 
-    for path in repos {
-        let display_name = path
-            .strip_prefix(&workspace.path)
-            .unwrap_or(&path)
-            .display()
-            .to_string()
-            .trim_start_matches('/')
-            .to_string();
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8);
 
-        // Update progress message (won't be visible during reload)
-        log_capture.set_message(format!("Loading workspace: {}", display_name));
+    let mut workspace_repos = Vec::new();
+    let mut library_repos = Vec::new();
 
-        // Check repo status and get modification time in a single repo open for performance
-        let (status, modification_time) = crate::check_repo_status_and_modification_time(&path)
-            .unwrap_or((crate::RepoStatus::NoCommits, None));
+    std::thread::scope(|scope| {
+        let (tx, rx) = mpsc::channel();
 
-        // A repo is only clean if it has commits, no changes, and no unpushed commits
-        let is_clean = matches!(status, crate::RepoStatus::Clean);
-
-        // Size not computed for workspace repos to save time
-        let size_bytes = None;
-
-        // Add the main repository
-        repo_infos.push(RepoInfo {
-            path: path.clone(),
-            display_name: display_name.clone(),
-            is_clean,
-            modification_time,
-            size_bytes,
-            operation_status: tree::RepoOperationStatus::None,
-            is_submodule: false,
-            submodule_initialized: false,
-            parent_repo_path: None,
-        });
-
-        // Find and add submodules
-        if let Ok(submodules) = crate::find_submodules_in_repo(&path) {
-            for submodule in submodules {
-                let submodule_display_name = if display_name.is_empty() {
-                    submodule.path.display().to_string()
-                } else {
-                    format!("{}/{}", display_name, submodule.path.display())
-                };
-
-                // Update progress for submodule
-                log_capture.set_message(format!("Loading submodule: {}", submodule_display_name));
-
-                repo_infos.push(RepoInfo {
-                    path: path.join(&submodule.path),
-                    display_name: submodule_display_name,
-                    is_clean: true, // Submodule status computed separately
-                    modification_time: None,
-                    size_bytes: None,
-                    operation_status: tree::RepoOperationStatus::None,
-                    is_submodule: true,
-                    submodule_initialized: submodule.initialized,
-                    parent_repo_path: Some(path.clone()),
-                });
-            }
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let tasks = &tasks;
+            let workspace_path = workspace.path.as_str();
+            let library_path = library_path.as_str();
+            scope.spawn(move || {
+                loop {
+                    let task = tasks.lock().unwrap().pop();
+                    let Some(task) = task else {
+                        break;
+                    };
+                    let result = match task {
+                        ScanTask::Workspace(path) => {
+                            Scanned::Workspace(scan_workspace_repo(workspace_path, path))
+                        }
+                        ScanTask::Library(repo_path) => {
+                            Scanned::Library(scan_library_repo(library_path, repo_path))
+                        }
+                    };
+                    if tx.send(result).is_err() {
+                        break;
+                    }
+                }
+            });
         }
-    }
+        drop(tx);
 
-    repo_infos
-}
+        // Drain results on this thread, reporting progress as they arrive
+        let mut done = 0;
+        while let Ok(result) = rx.recv() {
+            done += 1;
+            let name = match &result {
+                Scanned::Workspace(infos) => infos
+                    .first()
+                    .map(|r| r.display_name.clone())
+                    .unwrap_or_default(),
+                Scanned::Library(info) => info.display_name.clone(),
+            };
+            match result {
+                Scanned::Workspace(infos) => workspace_repos.extend(infos),
+                Scanned::Library(info) => library_repos.push(info),
+            }
 
-/// Collect library repositories with metadata (without UI updates - for reloads)
-fn collect_library_repos(workspace: &Workspace, log_capture: &LogCapture) -> Vec<RepoInfo> {
-    let library_repos = workspace.list_library().unwrap_or_default();
-    let mut repo_infos = Vec::new();
+            let spinner = SPINNER_FRAMES[done % SPINNER_FRAMES.len()];
+            let message = format!("{} Loading: {} ({}/{})", spinner, name, done, total);
+            on_progress(&message, &workspace_repos, &library_repos);
+        }
+    });
 
-    for repo_path in library_repos {
-        // Update progress message (won't be visible during reload)
-        log_capture.set_message(format!("Loading library: {}", repo_path));
-
-        let full_path = PathBuf::from(&workspace.library_path()).join(&repo_path);
-        // Get modification time for library repos
-        let modification_time = get_repo_modification_time(&full_path, true).ok();
-        // Get size for library repos
-        let size_bytes = get_repo_size(&full_path).ok();
-
-        repo_infos.push(RepoInfo {
-            path: full_path,
-            display_name: repo_path,
-            is_clean: true, // Library repos are always clean
-            modification_time,
-            size_bytes,
-            operation_status: tree::RepoOperationStatus::None,
-            is_submodule: false,
-            submodule_initialized: false,
-            parent_repo_path: None,
-        });
-    }
-
-    repo_infos
+    (workspace_repos, library_repos)
 }
 
 /// Get the configured GitHub hostname from gh CLI
@@ -1477,14 +1020,11 @@ fn get_github_hostname() -> String {
         .args(["auth", "status", "--active", "--json", "hosts"])
         .output()
         && output.status.success()
+        && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        && let Some(hosts) = json.get("hosts").and_then(|h| h.as_object())
+        && let Some(hostname) = hosts.keys().next()
     {
-        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-            if let Some(hosts) = json.get("hosts").and_then(|h| h.as_object()) {
-                if let Some(hostname) = hosts.keys().next() {
-                    return hostname.clone();
-                }
-            }
-        }
+        return hostname.clone();
     }
     // Default to github.com if we can't determine the hostname
     "github.com".to_string()

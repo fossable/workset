@@ -1,13 +1,9 @@
 use anyhow::Result;
 use std::io::IsTerminal;
+use std::path::Path;
 use tracing::level_filters::LevelFilter;
 use tracing::{error, info};
 use workset::Workspace;
-
-/// Build info provided by built crate.
-pub mod build_info {
-    include!(concat!(env!("OUT_DIR"), "/built.rs"));
-}
 
 /// ANSI color codes
 mod colors {
@@ -95,10 +91,8 @@ fn clone_repos(workspace: &Workspace, pattern: &workset::RepoPattern) -> Result<
             let mut skipped = 0;
 
             for repo in repos {
-                let repo_pattern: workset::RepoPattern =
-                    format!("{}/{}", provider, repo)
-                        .parse()
-                        .map_err(|e| anyhow::anyhow!("Failed to parse repo pattern: {}", e))?;
+                let Ok(repo_pattern) =
+                    format!("{}/{}", provider, repo).parse::<workset::RepoPattern>();
 
                 // Check if repo already exists in workspace
                 let repo_path = PathBuf::from(&workspace.path).join(repo_pattern.full_path());
@@ -153,30 +147,12 @@ fn clone_single_repo(workspace: &Workspace, pattern: &workset::RepoPattern) -> R
     // Clone from remote
     if let Some((provider, repo_path_str)) = pattern.provider_and_path() {
         let clone_url = format!("https://{}/{}", provider, repo_path_str);
-        let dest_path = format!("{}/{}", workspace.path, pattern.full_path());
-
-        // Create parent directories
-        if let Some(parent) = std::path::Path::new(&dest_path).parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let dest_path = PathBuf::from(&workspace.path).join(pattern.full_path());
 
         info!(repo = %pattern.full_path(), "Cloning repository");
 
         // TODO show progress
-        let mut prepare_fetch = gix::clone::PrepareFetch::new(
-            clone_url,
-            std::path::Path::new(&dest_path),
-            gix::create::Kind::WithWorktree,
-            gix::create::Options::default(),
-            gix::open::Options::isolated(),
-        )?;
-
-        let should_interrupt = std::sync::atomic::AtomicBool::new(false);
-        let (mut prepare_checkout, _fetch_outcome) =
-            prepare_fetch.fetch_then_checkout(gix::progress::Discard, &should_interrupt)?;
-
-        let (_repo, _checkout_outcome) =
-            prepare_checkout.main_worktree(gix::progress::Discard, &should_interrupt)?;
+        workset::gix_clone(&clone_url, &dest_path)?;
 
         info!(repo = %pattern.full_path(), "Successfully cloned repository");
         Ok(())
@@ -273,7 +249,7 @@ fn main() -> Result<()> {
         let is_tty = std::io::stdout().is_terminal();
 
         let help = format!(
-            r#"{workset} {version} ({built})
+            r#"{workset} {version}
 
 {desc_header}
   Manage git repos with working sets.
@@ -314,13 +290,12 @@ fn main() -> Result<()> {
                 format!(
                     "{}{}{}",
                     colors::CYAN,
-                    build_info::PKG_VERSION,
+                    env!("CARGO_PKG_VERSION"),
                     colors::RESET
                 )
             } else {
-                build_info::PKG_VERSION.to_string()
+                env!("CARGO_PKG_VERSION").to_string()
             },
-            built = build_info::BUILT_TIME_UTC,
             desc_header = if is_tty {
                 format!("{}{}{}", colors::BOLD, "DESCRIPTION:", colors::RESET)
             } else {
@@ -372,9 +347,7 @@ fn main() -> Result<()> {
             "clone" => {
                 if let Some(workspace) = maybe_workspace {
                     if let Some(pattern_str) = args.opt_free_from_str::<String>()? {
-                        let pattern: workset::RepoPattern = pattern_str
-                            .parse()
-                            .map_err(|e| anyhow::anyhow!("Failed to parse pattern: {}", e))?;
+                        let Ok(pattern) = pattern_str.parse::<workset::RepoPattern>();
                         clone_repos(&workspace, &pattern)?;
                     } else {
                         error!("Missing repository pattern for clone command");
@@ -387,9 +360,7 @@ fn main() -> Result<()> {
             "restore" => {
                 if let Some(workspace) = maybe_workspace {
                     if let Some(pattern_str) = args.opt_free_from_str::<String>()? {
-                        let pattern: workset::RepoPattern = pattern_str
-                            .parse()
-                            .map_err(|e| anyhow::anyhow!("Failed to parse pattern: {}", e))?;
+                        let Ok(pattern) = pattern_str.parse::<workset::RepoPattern>();
                         restore_repos(&workspace, &pattern)?;
                     } else {
                         error!("Missing repository pattern for restore command");
@@ -405,9 +376,7 @@ fn main() -> Result<()> {
                     let force = args.contains("--force");
 
                     if let Some(path) = args.opt_free_from_str::<String>()? {
-                        let pattern: workset::RepoPattern = path
-                            .parse()
-                            .map_err(|e| anyhow::anyhow!("Failed to parse pattern: {}", e))?;
+                        let Ok(pattern) = path.parse::<workset::RepoPattern>();
                         workspace.drop(&pattern, delete, force)?;
                     } else {
                         // Drop all repos in current directory
@@ -457,7 +426,7 @@ fn main() -> Result<()> {
 
 /// List all repositories in the workspace with their status
 fn list_workspace_status(workspace: &Workspace) -> Result<()> {
-    let repos = workset::find_git_repositories(&workspace.path)?;
+    let repos = workset::find_git_repositories(Path::new(&workspace.path))?;
 
     if repos.is_empty() {
         println!("No repositories found in workspace");
@@ -501,7 +470,7 @@ fn show_workspace_summary(workspace: &Workspace) -> Result<()> {
 
     // Count repositories in workspace
     println!();
-    if let Ok(repos) = workset::find_git_repositories(&workspace.path) {
+    if let Ok(repos) = workset::find_git_repositories(Path::new(&workspace.path)) {
         println!("Active repositories: {}", repos.len());
 
         let mut clean = 0;
@@ -537,7 +506,7 @@ fn get_repo_completions(workspace: &Workspace) -> Vec<String> {
     let mut repos = Vec::new();
 
     // Only complete with local workspace repos
-    if let Ok(local_repos) = workset::find_git_repositories(&workspace.path) {
+    if let Ok(local_repos) = workset::find_git_repositories(Path::new(&workspace.path)) {
         for repo in local_repos {
             if let Ok(relative) = repo.strip_prefix(&workspace.path) {
                 repos.push(relative.display().to_string());
@@ -555,16 +524,18 @@ fn get_repo_completions_with_metadata(workspace: &Workspace) -> Vec<(String, Str
     let mut repos = Vec::new();
 
     // Only complete with local workspace repos
-    if let Ok(local_repos) = workset::find_git_repositories(&workspace.path) {
+    if let Ok(local_repos) = workset::find_git_repositories(Path::new(&workspace.path)) {
         for repo in local_repos {
             if let Ok(relative) = repo.strip_prefix(&workspace.path) {
                 let repo_name = relative.display().to_string();
 
-                // Get repo status and modification time
-                // If these fail, we'll still provide a basic completion
-                let status = workset::check_repo_status(&repo).ok();
-                let is_clean = matches!(status, Some(workset::RepoStatus::Clean));
-                let mod_time = workset::get_repo_modification_time(&repo, is_clean).ok();
+                // Get repo status and modification time in a single repo open
+                // If this fails, we'll still provide a basic completion
+                let (status, mod_time) =
+                    match workset::check_repo_status_and_modification_time(&repo) {
+                        Ok((status, mod_time)) => (Some(status), mod_time),
+                        Err(_) => (None, None),
+                    };
 
                 // Build description with status and time
                 let mut desc_parts = Vec::new();

@@ -11,10 +11,19 @@ pub enum AppMode {
     CloneRepo,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 pub enum Section {
     Workspace,
     Library,
+}
+
+impl Section {
+    fn other(self) -> Self {
+        match self {
+            Section::Workspace => Section::Library,
+            Section::Library => Section::Workspace,
+        }
+    }
 }
 
 pub struct App {
@@ -38,44 +47,26 @@ pub struct App {
 
 impl App {
     pub fn new(workspace_repos: Vec<RepoInfo>, library_repos: Vec<RepoInfo>) -> Self {
-        let workspace_tree = build_tree(workspace_repos.clone());
-        let library_tree = build_library_tree(library_repos.clone(), &workspace_repos);
-
-        let filtered_workspace = workspace_tree.clone();
-        let filtered_library = library_tree.clone();
-
-        let mut workspace_state = TreeState::new();
-        let mut library_state = TreeState::new();
-
-        // Select first item in whichever section has items
-        let active_section = if !workspace_tree.is_empty() {
-            workspace_state.select(Some(0));
-            Section::Workspace
-        } else if !library_tree.is_empty() {
-            library_state.select(Some(0));
-            Section::Library
-        } else {
-            Section::Workspace
-        };
-
-        Self {
-            workspace_tree,
-            library_tree,
-            workspace_repos_list: workspace_repos,
-            library_repos_list: library_repos,
-            filtered_workspace,
-            filtered_library,
-            workspace_state,
-            library_state,
+        let mut app = Self {
+            workspace_tree: Vec::new(),
+            library_tree: Vec::new(),
+            workspace_repos_list: Vec::new(),
+            library_repos_list: Vec::new(),
+            filtered_workspace: Vec::new(),
+            filtered_library: Vec::new(),
+            workspace_state: TreeState::new(),
+            library_state: TreeState::new(),
             search_query: String::new(),
-            active_section,
+            active_section: Section::Workspace,
             matcher: SkimMatcherV2::default(),
             last_log_message: String::new(),
             mode: AppMode::Normal,
             clone_repo_input: String::new(),
             clone_repo_suggestions: Vec::new(),
             clone_repo_state: TreeState::new(),
-        }
+        };
+        app.update_repos(workspace_repos, library_repos);
+        app
     }
 
     pub fn filter_repos(&mut self) {
@@ -83,58 +74,45 @@ impl App {
             self.filtered_workspace = self.workspace_tree.clone();
             self.filtered_library = self.library_tree.clone();
         } else {
-            // Filter workspace repos by search query
-            let filtered_workspace_repos: Vec<RepoInfo> = self
-                .workspace_repos_list
-                .iter()
-                .filter(|r| {
-                    self.matcher
-                        .fuzzy_match(&r.display_name, &self.search_query)
-                        .is_some()
-                })
-                .cloned()
-                .collect();
-            self.filtered_workspace = build_tree(filtered_workspace_repos);
-
-            // Filter library repos by search query
-            let filtered_library_repos: Vec<RepoInfo> = self
-                .library_repos_list
-                .iter()
-                .filter(|r| {
-                    self.matcher
-                        .fuzzy_match(&r.display_name, &self.search_query)
-                        .is_some()
-                })
-                .cloned()
-                .collect();
-            self.filtered_library =
-                build_library_tree(filtered_library_repos, &self.workspace_repos_list);
+            // Filter repos by fuzzy-matching the search query
+            let matches = |r: &&RepoInfo| {
+                self.matcher
+                    .fuzzy_match(&r.display_name, &self.search_query)
+                    .is_some()
+            };
+            self.filtered_workspace = build_tree(
+                self.workspace_repos_list
+                    .iter()
+                    .filter(matches)
+                    .cloned()
+                    .collect(),
+            );
+            self.filtered_library = build_library_tree(
+                self.library_repos_list
+                    .iter()
+                    .filter(matches)
+                    .cloned()
+                    .collect(),
+                &self.workspace_repos_list,
+            );
         }
 
-        // Flatten to get item counts
-        let workspace_flat = flatten_trees(&self.filtered_workspace);
-        let library_flat = flatten_trees(&self.filtered_library);
-
-        // Reset selection
-        if !workspace_flat.is_empty() {
-            self.workspace_state.select(Some(0));
-            self.library_state.select(None);
-            self.active_section = Section::Workspace;
-        } else if !library_flat.is_empty() {
-            self.workspace_state.select(None);
-            self.library_state.select(Some(0));
-            self.active_section = Section::Library;
+        // Reset selection to the first section with items
+        if !self.filtered_workspace.is_empty() {
+            self.select(Section::Workspace, 0);
+        } else if !self.filtered_library.is_empty() {
+            self.select(Section::Library, 0);
         } else {
             self.workspace_state.select(None);
             self.library_state.select(None);
         }
     }
 
-    pub fn get_flattened_workspace(&self) -> Vec<(TreeNode, usize, Vec<usize>, String)> {
+    pub fn get_flattened_workspace(&self) -> Vec<(&TreeNode, usize, Vec<usize>, String)> {
         flatten_trees(&self.filtered_workspace)
     }
 
-    pub fn get_flattened_library(&self) -> Vec<(TreeNode, usize, Vec<usize>, String)> {
+    pub fn get_flattened_library(&self) -> Vec<(&TreeNode, usize, Vec<usize>, String)> {
         flatten_trees(&self.filtered_library)
     }
 
@@ -146,146 +124,115 @@ impl App {
         count_repos_in_trees(&self.filtered_library)
     }
 
-    pub fn next(&mut self) {
-        match self.active_section {
-            Section::Workspace => {
-                let workspace_items = self.get_flattened_workspace();
-                if workspace_items.is_empty() {
-                    return;
-                }
-                let i = match self.workspace_state.selected() {
-                    Some(i) => {
-                        if i >= workspace_items.len() - 1 {
-                            // Move to library section if available
-                            let library_items = self.get_flattened_library();
-                            if !library_items.is_empty() {
-                                self.workspace_state.select(None);
-                                self.library_state.select(Some(0));
-                                self.active_section = Section::Library;
-                                return;
-                            }
-                            0
-                        } else {
-                            i + 1
-                        }
-                    }
-                    None => 0,
-                };
-                self.workspace_state.select(Some(i));
-            }
-            Section::Library => {
-                let library_items = self.get_flattened_library();
-                if library_items.is_empty() {
-                    return;
-                }
-                let i = match self.library_state.selected() {
-                    Some(i) => {
-                        if i >= library_items.len() - 1 {
-                            // Wrap to workspace section if available
-                            let workspace_items = self.get_flattened_workspace();
-                            if !workspace_items.is_empty() {
-                                self.library_state.select(None);
-                                self.workspace_state.select(Some(0));
-                                self.active_section = Section::Workspace;
-                                return;
-                            }
-                            0
-                        } else {
-                            i + 1
-                        }
-                    }
-                    None => 0,
-                };
-                self.library_state.select(Some(i));
-            }
+    /// Select the given index in the given section, clearing the other section
+    fn select(&mut self, section: Section, index: usize) {
+        let (target, other) = match section {
+            Section::Workspace => (&mut self.workspace_state, &mut self.library_state),
+            Section::Library => (&mut self.library_state, &mut self.workspace_state),
+        };
+        target.select(Some(index));
+        other.select(None);
+        self.active_section = section;
+    }
+
+    /// Number of visible (flattened) items in the given section
+    fn section_len(&self, section: Section) -> usize {
+        match section {
+            Section::Workspace => flatten_trees(&self.filtered_workspace).len(),
+            Section::Library => flatten_trees(&self.filtered_library).len(),
         }
+    }
+
+    /// Switch to the other section if it has any items
+    pub fn switch_section(&mut self) {
+        let other = self.active_section.other();
+        if self.section_len(other) > 0 {
+            self.select(other, 0);
+        }
+    }
+
+    pub fn next(&mut self) {
+        self.move_selection(1);
     }
 
     pub fn previous(&mut self) {
-        match self.active_section {
-            Section::Workspace => {
-                let workspace_items = self.get_flattened_workspace();
-                if workspace_items.is_empty() {
-                    return;
-                }
-                let i = match self.workspace_state.selected() {
-                    Some(i) => {
-                        if i == 0 {
-                            // Move to library section if available
-                            let library_items = self.get_flattened_library();
-                            if !library_items.is_empty() {
-                                self.workspace_state.select(None);
-                                self.library_state.select(Some(library_items.len() - 1));
-                                self.active_section = Section::Library;
-                                return;
-                            }
-                            workspace_items.len() - 1
-                        } else {
-                            i - 1
-                        }
-                    }
-                    None => 0,
-                };
-                self.workspace_state.select(Some(i));
-            }
-            Section::Library => {
-                let library_items = self.get_flattened_library();
-                if library_items.is_empty() {
-                    return;
-                }
-                let i = match self.library_state.selected() {
-                    Some(i) => {
-                        if i == 0 {
-                            // Wrap to workspace section if available
-                            let workspace_items = self.get_flattened_workspace();
-                            if !workspace_items.is_empty() {
-                                self.library_state.select(None);
-                                self.workspace_state.select(Some(workspace_items.len() - 1));
-                                self.active_section = Section::Workspace;
-                                return;
-                            }
-                            library_items.len() - 1
-                        } else {
-                            i - 1
-                        }
-                    }
-                    None => 0,
-                };
-                self.library_state.select(Some(i));
-            }
+        self.move_selection(-1);
+    }
+
+    /// Move the selection by one, crossing into the other section at the edges
+    fn move_selection(&mut self, delta: isize) {
+        let section = self.active_section;
+        let current_len = self.section_len(section);
+        if current_len == 0 {
+            return;
+        }
+
+        let selected = match section {
+            Section::Workspace => self.workspace_state.selected(),
+            Section::Library => self.library_state.selected(),
+        };
+        let Some(i) = selected else {
+            self.select(section, 0);
+            return;
+        };
+
+        let at_edge = if delta > 0 {
+            i + 1 >= current_len
+        } else {
+            i == 0
+        };
+        if !at_edge {
+            self.select(section, i.saturating_add_signed(delta));
+        } else if self.section_len(section.other()) > 0 {
+            // Cross into the other section (top when moving down, bottom when moving up)
+            let other_len = self.section_len(section.other());
+            let index = if delta > 0 { 0 } else { other_len - 1 };
+            self.select(section.other(), index);
+        } else {
+            // Wrap within the current section
+            let index = if delta > 0 { 0 } else { current_len - 1 };
+            self.select(section, index);
         }
     }
 
-    pub fn selected_workspace_node(&self) -> Option<TreeNode> {
-        let items = self.get_flattened_workspace();
-        self.workspace_state
-            .selected()
-            .and_then(|i| items.get(i).map(|(node, _, _, _)| node.clone()))
-    }
-
-    pub fn selected_library_node(&self) -> Option<TreeNode> {
-        let items = self.get_flattened_library();
-        self.library_state
-            .selected()
-            .and_then(|i| items.get(i).map(|(node, _, _, _)| node.clone()))
+    /// The currently selected tree node in the active section
+    pub fn selected_node(&self) -> Option<&TreeNode> {
+        let (trees, state) = match self.active_section {
+            Section::Workspace => (&self.filtered_workspace, &self.workspace_state),
+            Section::Library => (&self.filtered_library, &self.library_state),
+        };
+        let index = state.selected()?;
+        flatten_trees(trees).get(index).map(|(node, _, _, _)| *node)
     }
 
     pub fn toggle_expand(&mut self) {
-        if self.active_section == Section::Workspace {
-            let items = self.get_flattened_workspace();
-            if let Some(selected_idx) = self.workspace_state.selected()
-                && let Some((_, _, index_path, _)) = items.get(selected_idx).cloned()
-            {
-                toggle_node_at_path(&mut self.filtered_workspace, &index_path);
-            }
-        } else {
-            let items = self.get_flattened_library();
-            if let Some(selected_idx) = self.library_state.selected()
-                && let Some((_, _, index_path, _)) = items.get(selected_idx).cloned()
-            {
-                toggle_node_at_path(&mut self.filtered_library, &index_path);
-            }
+        let (trees, state) = match self.active_section {
+            Section::Workspace => (&self.filtered_workspace, &self.workspace_state),
+            Section::Library => (&self.filtered_library, &self.library_state),
+        };
+        let index_path = state.selected().and_then(|i| {
+            flatten_trees(trees)
+                .get(i)
+                .map(|(_, _, path, _)| path.clone())
+        });
+
+        if let Some(index_path) = index_path {
+            let trees = match self.active_section {
+                Section::Workspace => &mut self.filtered_workspace,
+                Section::Library => &mut self.filtered_library,
+            };
+            toggle_node_at_path(trees, &index_path);
         }
+    }
+
+    /// Clone-dialog suggestions filtered by the current input
+    pub fn filtered_suggestions(&self) -> Vec<&str> {
+        let input = self.clone_repo_input.to_lowercase();
+        self.clone_repo_suggestions
+            .iter()
+            .filter(|s| s.to_lowercase().contains(&input))
+            .map(|s| s.as_str())
+            .collect()
     }
 
     pub fn update_repo_status(
@@ -316,11 +263,9 @@ impl App {
 
         // Ensure something is selected if we have repos
         if self.workspace_state.selected().is_none() && !self.workspace_tree.is_empty() {
-            self.workspace_state.select(Some(0));
-            self.active_section = Section::Workspace;
+            self.select(Section::Workspace, 0);
         } else if self.library_state.selected().is_none() && !self.library_tree.is_empty() {
-            self.library_state.select(Some(0));
-            self.active_section = Section::Library;
+            self.select(Section::Library, 0);
         }
     }
 }
