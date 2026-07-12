@@ -22,6 +22,7 @@ impl TreeState {
 #[derive(Clone, PartialEq)]
 pub enum RepoOperationStatus {
     None,
+    Cloning,
     Dropping,
     Restoring,
     Success,

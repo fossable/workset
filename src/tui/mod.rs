@@ -55,7 +55,6 @@ struct RepoLoader {
     library_repos: Vec<RepoInfo>,
     done: usize,
     total: usize,
-    last_name: String,
     /// Show partial results as they arrive (initial load); otherwise the app
     /// keeps its current data until the scan completes (background refresh).
     progressive: bool,
@@ -72,7 +71,6 @@ impl RepoLoader {
             library_repos: Vec::new(),
             done: 0,
             total: 0,
-            last_name: String::new(),
             progressive,
         }
     }
@@ -85,15 +83,11 @@ impl RepoLoader {
             match self.rx.try_recv() {
                 Ok(LoadEvent::Total(total)) => self.total = total,
                 Ok(LoadEvent::Workspace(infos)) => {
-                    if let Some(info) = infos.first() {
-                        self.last_name = info.display_name.clone();
-                    }
                     self.workspace_repos.extend(infos);
                     self.done += 1;
                     received = true;
                 }
                 Ok(LoadEvent::Library(info)) => {
-                    self.last_name = info.display_name.clone();
                     self.library_repos.push(info);
                     self.done += 1;
                     received = true;
@@ -109,15 +103,12 @@ impl RepoLoader {
                 std::mem::take(&mut self.library_repos),
             );
             if self.progressive {
-                app.last_log_message.clear();
+                app.loading_progress = None;
             }
         } else if received && self.progressive {
             app.update_repos(self.workspace_repos.clone(), self.library_repos.clone());
             let spinner = SPINNER_FRAMES[self.done % SPINNER_FRAMES.len()];
-            app.last_log_message = format!(
-                "{} Loading: {} ({}/{})",
-                spinner, self.last_name, self.done, self.total
-            );
+            app.loading_progress = Some(format!("{} {}/{}", spinner, self.done, self.total));
         }
 
         !finished
@@ -128,7 +119,9 @@ impl RepoLoader {
 struct BackgroundTasks {
     loader: Option<RepoLoader>,
     suggestions: Option<mpsc::Receiver<Vec<String>>>,
-    clone_result: Option<mpsc::Receiver<String>>,
+    /// Delivers the error (if any) once the background clone of the given
+    /// repo pattern finishes
+    clone_result: Option<(String, mpsc::Receiver<Option<String>>)>,
     /// Delivers the file watcher once its (potentially slow) recursive
     /// registration of the workspace tree completes
     watcher: Option<mpsc::Receiver<Result<FileWatcher, notify::Error>>>,
@@ -176,8 +169,8 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
         let mut terminal = Terminal::new(backend)?;
 
         // Create app with empty data; repos stream in from the background loader
-        let mut app = App::new(Vec::new(), Vec::new());
-        app.last_log_message = "Loading repositories...".to_string();
+        let mut app = App::new(workspace.path.clone(), Vec::new(), Vec::new());
+        app.loading_progress = Some("loading...".to_string());
 
         // Setup the debounced filesystem watcher on a background thread, since
         // recursively registering a large workspace can take a while and would
@@ -245,7 +238,7 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                     break;
                 }
                 Action::DropToLibrary(repo_paths) => {
-                    let message = run_repo_operation(
+                    run_repo_operation(
                         &mut terminal,
                         &mut app,
                         &repo_paths,
@@ -254,38 +247,32 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                             let Ok(pattern) = repo_path.parse::<RepoPattern>();
                             workspace.drop(&pattern, false, false)
                         },
-                        "Dropped",
                     )?;
-                    app.last_log_message = message;
                     background.loader = Some(RepoLoader::start(workspace, false));
                 }
                 Action::RestoreFromLibrary(repo_paths) => {
-                    let message = run_repo_operation(
+                    run_repo_operation(
                         &mut terminal,
                         &mut app,
                         &repo_paths,
                         RepoOperationStatus::Restoring,
                         |repo_path| workspace.restore_from_library(repo_path),
-                        "Restored",
                     )?;
-                    app.last_log_message = message;
                     background.loader = Some(RepoLoader::start(workspace, false));
                 }
                 Action::CloneRepo(repo_pattern) => {
-                    app.last_log_message = format!("Cloning repository {}...", repo_pattern);
+                    // Show a placeholder repo row while the clone runs
+                    app.add_pending_clone(repo_pattern.clone());
 
                     // Clone on a background thread; the file watcher picks up
                     // the new repo and triggers a refresh when it lands
                     let (tx, rx) = mpsc::channel();
-                    background.clone_result = Some(rx);
+                    background.clone_result = Some((repo_pattern.clone(), rx));
                     let workspace = workspace.clone();
                     std::thread::spawn(move || {
                         let Ok(pattern) = repo_pattern.parse::<RepoPattern>();
-                        let message = match workspace.open(&pattern) {
-                            Ok(_) => format!("Cloned repository {}", repo_pattern),
-                            Err(e) => format!("Failed to clone: {}", e),
-                        };
-                        let _ = tx.send(message);
+                        let error = workspace.open(&pattern).err().map(|e| e.to_string());
+                        let _ = tx.send(error);
                     });
                 }
                 Action::RefreshData => {
@@ -301,17 +288,14 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
 }
 
 /// Run a drop/restore operation over the given repos, updating each repo's
-/// status in the UI as it progresses. Returns the summary message.
+/// status in the UI as it progresses
 fn run_repo_operation<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     repo_paths: &[String],
     in_progress: RepoOperationStatus,
     mut operation: impl FnMut(&str) -> Result<()>,
-    verb: &str,
-) -> Result<String> {
-    let mut success_count = 0;
-    let mut error_count = 0;
+) -> Result<()> {
     let draw = |terminal: &mut Terminal<B>, app: &mut App| -> Result<()> {
         terminal
             .draw(|f| ui(f, app))
@@ -327,14 +311,8 @@ fn run_repo_operation<B: ratatui::backend::Backend>(
         std::thread::sleep(Duration::from_millis(100));
 
         match operation(repo_path) {
-            Ok(_) => {
-                app.update_repo_status(repo_path, RepoOperationStatus::Success);
-                success_count += 1;
-            }
-            Err(e) => {
-                app.update_repo_status(repo_path, RepoOperationStatus::Failed(e.to_string()));
-                error_count += 1;
-            }
+            Ok(_) => app.update_repo_status(repo_path, RepoOperationStatus::Success),
+            Err(e) => app.update_repo_status(repo_path, RepoOperationStatus::Failed(e.to_string())),
         }
         draw(terminal, app)?;
     }
@@ -342,11 +320,7 @@ fn run_repo_operation<B: ratatui::backend::Backend>(
     // Wait a moment for user to see the result
     std::thread::sleep(Duration::from_millis(500));
 
-    Ok(if error_count == 0 {
-        format!("{} {} repo(s)", verb, success_count)
-    } else {
-        format!("{} {} repo(s), {} failed", verb, success_count, error_count)
-    })
+    Ok(())
 }
 
 fn run_app<B: ratatui::backend::Backend>(
@@ -363,8 +337,8 @@ fn run_app<B: ratatui::backend::Backend>(
                     *file_watcher = Some(watcher);
                     background.watcher = None;
                 }
-                Ok(Err(e)) => {
-                    app.last_log_message = format!("File watching disabled: {}", e);
+                Ok(Err(_)) => {
+                    app.watch_disabled = true;
                     background.watcher = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -381,16 +355,22 @@ fn run_app<B: ratatui::backend::Backend>(
             }
         }
         poll_suggestions(app, background);
-        if let Some(rx) = &background.clone_result {
+        if let Some((pattern, rx)) = &background.clone_result {
             match rx.try_recv() {
-                Ok(message) => {
-                    app.last_log_message = message;
+                Ok(error) => {
+                    let pattern = pattern.clone();
+                    app.finish_pending_clone(&pattern, error);
                     background.clone_result = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => background.clone_result = None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    let pattern = pattern.clone();
+                    app.finish_pending_clone(&pattern, Some("clone interrupted".to_string()));
+                    background.clone_result = None;
+                }
             }
         }
+        app.expire_failed_clones(Duration::from_secs(5));
 
         terminal
             .draw(|f| ui(f, app))
@@ -589,15 +569,19 @@ fn ui(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    // Split vertically into rows
+    // Split vertically into rows; the search box only appears while a query
+    // is being typed
+    let show_search = !app.search_query.is_empty();
+    let mut constraints = vec![
+        Constraint::Length(1), // Help (at top)
+        Constraint::Min(0),    // Main area (workspace + library side by side)
+    ];
+    if show_search {
+        constraints.push(Constraint::Length(3)); // Search box
+    }
     let vertical_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // Help (at top)
-            Constraint::Min(0),    // Main area (workspace + library side by side)
-            Constraint::Length(3), // Search box
-            Constraint::Length(1), // Status/log message (at bottom)
-        ])
+        .constraints(constraints)
         .split(f.area());
 
     // Split the main area horizontally into workspace (left) and library (right)
@@ -613,29 +597,20 @@ fn ui(f: &mut Frame, app: &mut App) {
     render_tree_panel(f, app, horizontal_chunks[0], Section::Workspace);
     render_tree_panel(f, app, horizontal_chunks[1], Section::Library);
 
-    // Search box
-    let search_text = format!("{}_", app.search_query);
-    let search_style = if app.search_query.is_empty() {
-        Style::default()
-    } else {
-        Style::default().fg(Color::Yellow)
-    };
-    let search = Paragraph::new(search_text)
-        .style(search_style)
-        .alignment(Alignment::Left)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(search_style)
-                .title("Search"),
-        );
-    f.render_widget(search, vertical_chunks[2]);
-
-    // Status/log message (at bottom)
-    let status = Paragraph::new(app.last_log_message.as_str())
-        .style(Style::default().fg(Color::Gray))
-        .alignment(Alignment::Left);
-    f.render_widget(status, vertical_chunks[3]);
+    if show_search {
+        let search_text = format!("{}_", app.search_query);
+        let search_style = Style::default().fg(Color::Yellow);
+        let search = Paragraph::new(search_text)
+            .style(search_style)
+            .alignment(Alignment::Left)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(search_style)
+                    .title("Search"),
+            );
+        f.render_widget(search, vertical_chunks[2]);
+    }
 }
 
 /// Render the key-binding help line at the top of the screen
@@ -681,7 +656,7 @@ fn render_tree_panel(f: &mut Frame, app: &App, area: Rect, section: Section) {
         Section::Workspace => (
             app.get_flattened_workspace(),
             &app.workspace_state,
-            format!("Workspace ({})", app.count_workspace_repos()),
+            workspace_panel_title(app, area.width),
             true,
             (|repo| {
                 repo.modification_time
@@ -692,7 +667,7 @@ fn render_tree_panel(f: &mut Frame, app: &App, area: Rect, section: Section) {
         Section::Library => (
             app.get_flattened_library(),
             &app.library_state,
-            format!("Library ({})", app.count_library_repos()),
+            Line::from(format!("Library ({})", app.count_library_repos())),
             false,
             (|repo| repo.size_bytes.map(format_size).unwrap_or_default()) as IdleMetadata,
         ),
@@ -735,6 +710,58 @@ fn render_tree_panel(f: &mut Frame, app: &App, area: Rect, section: Section) {
     let mut list_state = ratatui::widgets::ListState::default();
     list_state.select(state.selected());
     f.render_stateful_widget(list, area, &mut list_state);
+}
+
+/// Title for the workspace panel: the workspace path (truncated to fit),
+/// repo count, and any transient loading/watcher markers
+fn workspace_panel_title(app: &App, panel_width: u16) -> Line<'static> {
+    let suffix = format!(" ({})", app.count_workspace_repos());
+
+    let mut markers = String::new();
+    if let Some(ref progress) = app.loading_progress {
+        markers.push_str(&format!(" {}", progress));
+    }
+    if app.watch_disabled {
+        markers.push_str(" [watch disabled]");
+    }
+
+    // Fit the path into what's left after borders, the count, and the markers
+    let max_path_width = (panel_width.saturating_sub(2) as usize)
+        .saturating_sub(suffix.chars().count())
+        .saturating_sub(markers.chars().count());
+    let path = truncate_start(&shorten_home(&app.workspace_path), max_path_width);
+
+    let mut spans = vec![Span::raw(format!("{}{}", path, suffix))];
+    if !markers.is_empty() {
+        spans.push(Span::styled(markers, Style::default().fg(Color::DarkGray)));
+    }
+    Line::from(spans)
+}
+
+/// Replace a home directory prefix with `~`
+fn shorten_home(path: &str) -> String {
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+        && let Some(rest) = path.strip_prefix(&home)
+        && (rest.is_empty() || rest.starts_with('/'))
+    {
+        return format!("~{}", rest);
+    }
+    path.to_string()
+}
+
+/// Truncate the front of a string with a leading ellipsis so it fits in
+/// `max_chars` characters
+fn truncate_start(s: &str, max_chars: usize) -> String {
+    let len = s.chars().count();
+    if len <= max_chars {
+        return s.to_string();
+    }
+    let Some(keep) = max_chars.checked_sub(1) else {
+        return String::new();
+    };
+    let tail: String = s.chars().skip(len - keep).collect();
+    format!("…{}", tail)
 }
 
 /// Render a single tree node as a list item
@@ -785,6 +812,9 @@ fn tree_list_item<'a>(
                     Style::default().fg(Color::DarkGray),
                 ));
             }
+        } else if repo.operation_status == RepoOperationStatus::Cloning {
+            // Placeholder rows for in-flight clones have no real status yet
+            spans.push(Span::styled("· ", Style::default().fg(Color::DarkGray)));
         } else if repo.is_clean {
             spans.push(Span::styled("✓ ", Style::default().fg(Color::Green)));
         } else {
@@ -821,6 +851,7 @@ fn tree_list_item<'a>(
 
         let (status_text, status_color) = match &repo.operation_status {
             RepoOperationStatus::None => (idle_metadata(repo), Color::DarkGray),
+            RepoOperationStatus::Cloning => ("cloning...".to_string(), Color::Magenta),
             RepoOperationStatus::Dropping => ("dropping...".to_string(), Color::Yellow),
             RepoOperationStatus::Restoring => ("restoring...".to_string(), Color::Cyan),
             RepoOperationStatus::Success => ("done".to_string(), Color::Green),
