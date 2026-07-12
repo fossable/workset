@@ -577,26 +577,43 @@ fn get_repo_completions_with_metadata(workspace: &Workspace) -> Vec<(String, Str
 /// Output dynamic completions for bash
 fn complete_bash(maybe_workspace: Option<Workspace>) -> Result<()> {
     let comp_line = std::env::var("COMP_LINE").unwrap_or_default();
-    let comp_point = std::env::var("COMP_POINT")
-        .unwrap_or_default()
-        .parse::<usize>()
-        .unwrap_or(0);
+
+    // COMP_POINT is the cursor's byte offset into COMP_LINE, but bash has
+    // multibyte quirks where it can exceed the line length or land inside a
+    // UTF-8 character; clamp it to the nearest valid boundary.
+    let mut comp_point = std::env::var("COMP_POINT")
+        .ok()
+        .and_then(|p| p.parse::<usize>().ok())
+        .unwrap_or(comp_line.len())
+        .min(comp_line.len());
+    while !comp_line.is_char_boundary(comp_point) {
+        comp_point -= 1;
+    }
 
     let current_line = &comp_line[..comp_point];
     let words: Vec<&str> = current_line.split_whitespace().collect();
 
-    // Determine what to complete based on context
-    if words.len() <= 1 {
-        // Complete subcommands
-        if maybe_workspace.is_some() {
-            println!("clone");
-            println!("restore");
-            println!("drop");
-            println!("list");
-            println!("ls");
-            println!("status");
+    // The word being completed: empty if the cursor follows whitespace,
+    // otherwise the last word. Bash inserts our output into COMPREPLY
+    // verbatim, so we must filter candidates by this prefix ourselves.
+    let (current_word, word_index) =
+        if current_line.is_empty() || current_line.ends_with(char::is_whitespace) {
+            ("", words.len())
         } else {
-            println!("init");
+            (*words.last().unwrap(), words.len() - 1)
+        };
+
+    if word_index <= 1 {
+        // Complete subcommands
+        let subcommands: &[&str] = if maybe_workspace.is_some() {
+            &["clone", "restore", "drop", "list", "ls", "status"]
+        } else {
+            &["init"]
+        };
+        for subcommand in subcommands {
+            if subcommand.starts_with(current_word) {
+                println!("{}", subcommand);
+            }
         }
     } else if let Some(workspace) = maybe_workspace {
         // Complete repository paths based on the subcommand
@@ -605,13 +622,17 @@ fn complete_bash(maybe_workspace: Option<Workspace>) -> Result<()> {
             // For restore, complete from library
             if let Ok(library_repos) = workspace.list_library() {
                 for repo in library_repos {
-                    println!("{}", repo);
+                    if repo.starts_with(current_word) {
+                        println!("{}", repo);
+                    }
                 }
             }
         } else {
             // For drop and other commands, complete from workspace
             for repo in get_repo_completions(&workspace) {
-                println!("{}", repo);
+                if repo.starts_with(current_word) {
+                    println!("{}", repo);
+                }
             }
         }
     }

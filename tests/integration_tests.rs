@@ -941,19 +941,47 @@ fn test_drop_with_absolute_paths() {
     );
 }
 
+// Shell completion tests. These invoke the binary exactly as a registered
+// shell completion would:
+//
+// - bash exports COMP_LINE (the full command line), COMP_POINT (the cursor's
+//   byte offset), COMP_TYPE (9 = TAB), and COMP_KEY to the completer, and a
+//   `complete -C` registration additionally passes three positional args.
+//   The completer's stdout becomes COMPREPLY verbatim, so the binary must
+//   filter candidates by the word at the cursor.
+// - fish never exports COMP_LINE itself; the registration wrapper passes the
+//   line truncated at the cursor (`commandline --cut-at-cursor`). Fish
+//   filters candidates by the current token, so the binary returns all
+//   candidates for the completion context.
+
+/// Send a bash completion request as bash would deliver it
+fn bash_complete(dir: &Path, comp_line: &str, comp_point: usize) -> std::process::Output {
+    Command::new(get_binary_path())
+        .env("_ARGCOMPLETE_", "bash")
+        .env("COMP_LINE", comp_line)
+        .env("COMP_POINT", comp_point.to_string())
+        .env("COMP_TYPE", "9")
+        .env("COMP_KEY", "9")
+        .current_dir(dir)
+        .output()
+        .expect("Failed to execute binary")
+}
+
+/// Send a fish completion request as the fish wrapper would deliver it
+fn fish_complete(dir: &Path, comp_line: &str) -> std::process::Output {
+    Command::new(get_binary_path())
+        .env("_ARGCOMPLETE_", "fish")
+        .env("COMP_LINE", comp_line)
+        .current_dir(dir)
+        .output()
+        .expect("Failed to execute binary")
+}
+
 #[test]
 fn test_bash_complete_init_without_workspace() {
-    let binary = get_binary_path();
     let temp_dir = TempDir::new().unwrap();
 
-    // Bash sets these environment variables when tab completion is triggered
-    let output = Command::new(&binary)
-        .env("_ARGCOMPLETE_", "bash")
-        .env("COMP_LINE", "workset ")
-        .env("COMP_POINT", "8") // Position after "workset "
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("Failed to execute binary");
+    let output = bash_complete(temp_dir.path(), "workset ", 8);
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
@@ -969,16 +997,9 @@ fn test_bash_complete_init_without_workspace() {
 #[test]
 fn test_bash_complete_drop_with_workspace() {
     let temp_dir = setup_test_workspace();
-    let binary = get_binary_path();
 
     // Bash completion after "workset " in a workspace
-    let output = Command::new(&binary)
-        .env("_ARGCOMPLETE_", "bash")
-        .env("COMP_LINE", "workset ")
-        .env("COMP_POINT", "8")
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("Failed to execute binary");
+    let output = bash_complete(temp_dir.path(), "workset ", 8);
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success());
@@ -991,16 +1012,9 @@ fn test_bash_complete_drop_with_workspace() {
 #[test]
 fn test_bash_complete_repo_paths() {
     let temp_dir = setup_test_workspace();
-    let binary = get_binary_path();
 
     // Bash completion after "workset drop "
-    let output = Command::new(&binary)
-        .env("_ARGCOMPLETE_", "bash")
-        .env("COMP_LINE", "workset drop ")
-        .env("COMP_POINT", "13") // Position after "workset drop "
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("Failed to execute binary");
+    let output = bash_complete(temp_dir.path(), "workset drop ", 13);
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success());
@@ -1015,42 +1029,23 @@ fn test_bash_complete_repo_paths() {
 #[test]
 fn test_bash_complete_with_cursor_in_middle() {
     let temp_dir = setup_test_workspace();
-    let binary = get_binary_path();
 
-    // Bash sets COMP_POINT to cursor position, not necessarily end of line
-    // Simulate: "workset dr|op" where | is cursor
-    // When cursor is at position 10, the current_line is "workset dr"
-    // which splits into ["workset", "dr"], so words.len() == 2
-    let output = Command::new(&binary)
-        .env("_ARGCOMPLETE_", "bash")
-        .env("COMP_LINE", "workset drop")
-        .env("COMP_POINT", "10") // Cursor after "workset dr"
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("Failed to execute binary");
+    // Bash sets COMP_POINT to cursor position, not necessarily end of line.
+    // Simulate: "workset dr|op" where | is cursor. The user is still typing
+    // the subcommand word, so the completions are the subcommands matching
+    // the prefix "dr".
+    let output = bash_complete(temp_dir.path(), "workset drop", 10);
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success());
-
-    // With 2 words in the current line, it completes repository paths
-    let completions: Vec<&str> = stdout.trim().split('\n').collect();
-    assert!(completions.contains(&"repo1"));
-    assert!(completions.contains(&"repo2"));
-    assert!(completions.contains(&"subdir/repo3"));
+    assert_eq!(stdout.trim(), "drop");
 }
 
 #[test]
 fn test_fish_complete_init_without_workspace() {
-    let binary = get_binary_path();
     let temp_dir = TempDir::new().unwrap();
 
-    // Fish sets COMP_LINE environment variable
-    let output = Command::new(&binary)
-        .env("_ARGCOMPLETE_", "fish")
-        .env("COMP_LINE", "workset ")
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("Failed to execute binary");
+    let output = fish_complete(temp_dir.path(), "workset ");
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success());
@@ -1065,15 +1060,9 @@ fn test_fish_complete_init_without_workspace() {
 #[test]
 fn test_fish_complete_drop_with_workspace() {
     let temp_dir = setup_test_workspace();
-    let binary = get_binary_path();
 
     // Fish completion after "workset "
-    let output = Command::new(&binary)
-        .env("_ARGCOMPLETE_", "fish")
-        .env("COMP_LINE", "workset ")
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("Failed to execute binary");
+    let output = fish_complete(temp_dir.path(), "workset ");
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success());
@@ -1086,21 +1075,12 @@ fn test_fish_complete_drop_with_workspace() {
 #[test]
 fn test_fish_complete_repo_paths() {
     let temp_dir = setup_test_workspace();
-    let binary = get_binary_path();
 
     // Fish completion after "workset drop "
-    let output = Command::new(&binary)
-        .env("_ARGCOMPLETE_", "fish")
-        .env("COMP_LINE", "workset drop ")
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("Failed to execute binary");
+    let output = fish_complete(temp_dir.path(), "workset drop ");
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success());
-
-    // Debug: print actual output
-    eprintln!("Fish completion output:\n{}", stdout);
 
     // Should list all repositories with status and modification time
     let lines: Vec<&str> = stdout.trim().split('\n').collect();
@@ -1141,20 +1121,14 @@ fn test_fish_complete_repo_paths() {
 #[test]
 fn test_fish_complete_partial_command() {
     let temp_dir = setup_test_workspace();
-    let binary = get_binary_path();
 
     // Fish completion after "workset dr" (no trailing space)
-    let output = Command::new(&binary)
-        .env("_ARGCOMPLETE_", "fish")
-        .env("COMP_LINE", "workset dr")
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("Failed to execute binary");
+    let output = fish_complete(temp_dir.path(), "workset dr");
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success());
 
-    // Should suggest all subcommands (fish completes even with partial input)
+    // Should suggest all subcommands; fish filters by the current token
     let expected = "clone\tClone new repository(ies) to workspace\nrestore\tRestore repository(ies) from library\ndrop\tDrop one or more repositories\nlist\tList all repositories with their status\nls\tList all repositories with their status\nstatus\tShow workspace summary and statistics";
     assert_eq!(stdout.trim(), expected);
 }
@@ -1179,39 +1153,25 @@ fn test_unsupported_shell() {
 }
 
 #[test]
-fn test_bash_empty_comp_line() {
-    let binary = get_binary_path();
+fn test_bash_complete_command_name_itself() {
     let temp_dir = setup_test_workspace();
 
-    // Empty COMP_LINE (just "workset" with no space)
-    let output = Command::new(&binary)
-        .env("_ARGCOMPLETE_", "bash")
-        .env("COMP_LINE", "workset")
-        .env("COMP_POINT", "7")
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("Failed to execute binary");
+    // Cursor at the end of "workset" with no space: the word at the cursor is
+    // the command name itself. No subcommand matches that prefix, so there is
+    // nothing for us to offer (bash completes command names on its own).
+    let output = bash_complete(temp_dir.path(), "workset", 7);
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success());
-
-    // Should suggest all commands
-    let expected = "clone\nrestore\ndrop\nlist\nls\nstatus";
-    assert_eq!(stdout.trim(), expected);
+    assert_eq!(stdout.trim(), "");
 }
 
 #[test]
 fn test_fish_empty_comp_line() {
-    let binary = get_binary_path();
     let temp_dir = setup_test_workspace();
 
-    // Empty COMP_LINE (just "workset" with no space)
-    let output = Command::new(&binary)
-        .env("_ARGCOMPLETE_", "fish")
-        .env("COMP_LINE", "workset")
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("Failed to execute binary");
+    // Just "workset" with no space
+    let output = fish_complete(temp_dir.path(), "workset");
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success());
@@ -1224,16 +1184,9 @@ fn test_fish_empty_comp_line() {
 #[test]
 fn test_bash_complete_with_trailing_spaces() {
     let temp_dir = setup_test_workspace();
-    let binary = get_binary_path();
 
-    // Multiple spaces after command
-    let output = Command::new(&binary)
-        .env("_ARGCOMPLETE_", "bash")
-        .env("COMP_LINE", "workset   ")
-        .env("COMP_POINT", "10") // After multiple spaces
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("Failed to execute binary");
+    // Multiple spaces after command, cursor at the end
+    let output = bash_complete(temp_dir.path(), "workset   ", 10);
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success());
@@ -1246,38 +1199,23 @@ fn test_bash_complete_with_trailing_spaces() {
 #[test]
 fn test_bash_complete_list_command() {
     let temp_dir = setup_test_workspace();
-    let binary = get_binary_path();
 
-    // Bash completion after "workset l" - testing command prefix matching
-    let output = Command::new(&binary)
-        .env("_ARGCOMPLETE_", "bash")
-        .env("COMP_LINE", "workset l")
-        .env("COMP_POINT", "9")
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("Failed to execute binary");
+    // Bash completion after "workset l" - the user is typing the subcommand,
+    // so only the subcommands matching the prefix "l" are offered
+    let output = bash_complete(temp_dir.path(), "workset l", 9);
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success());
-
-    // With 2 words, completes repos (not subcommands)
-    let completions: Vec<&str> = stdout.trim().split('\n').collect();
-    assert!(completions.contains(&"repo1"));
+    assert_eq!(stdout.trim(), "list\nls");
 }
 
 #[test]
 fn test_fish_complete_with_multiple_args() {
     let temp_dir = setup_test_workspace();
-    let binary = get_binary_path();
 
     // Fish completion after "workset drop repo1 "
     // Testing that it continues offering completions
-    let output = Command::new(&binary)
-        .env("_ARGCOMPLETE_", "fish")
-        .env("COMP_LINE", "workset drop repo1 ")
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("Failed to execute binary");
+    let output = fish_complete(temp_dir.path(), "workset drop repo1 ");
 
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success());
@@ -1298,14 +1236,16 @@ fn test_fish_complete_with_multiple_args() {
 
 #[test]
 fn test_bash_no_comp_point() {
-    let binary = get_binary_path();
     let temp_dir = setup_test_workspace();
 
-    // Missing COMP_POINT should default to 0
-    let output = Command::new(&binary)
+    // Real bash always sets COMP_POINT; if it's somehow missing, the cursor
+    // is assumed to be at the end of the line
+    let output = Command::new(get_binary_path())
         .env("_ARGCOMPLETE_", "bash")
-        .env("COMP_LINE", "workset ")
+        .env("COMP_LINE", "workset drop ")
         // No COMP_POINT set
+        .env("COMP_TYPE", "9")
+        .env("COMP_KEY", "9")
         .current_dir(temp_dir.path())
         .output()
         .expect("Failed to execute binary");
@@ -1313,32 +1253,18 @@ fn test_bash_no_comp_point() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success());
 
-    // With COMP_POINT=0, current_line is empty, so words.len() <= 1
-    let expected = "clone\nrestore\ndrop\nlist\nls\nstatus";
-    assert_eq!(stdout.trim(), expected);
+    let completions: Vec<&str> = stdout.trim().split('\n').collect();
+    assert!(completions.contains(&"repo1"));
+    assert!(completions.contains(&"repo2"));
+    assert!(completions.contains(&"subdir/repo3"));
 }
 
 #[test]
 fn test_fish_vs_bash_output_format() {
     let temp_dir = TempDir::new().unwrap();
-    let binary = get_binary_path();
 
-    // Get bash output
-    let bash_output = Command::new(&binary)
-        .env("_ARGCOMPLETE_", "bash")
-        .env("COMP_LINE", "workset ")
-        .env("COMP_POINT", "8")
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("Failed to execute binary");
-
-    // Get fish output
-    let fish_output = Command::new(&binary)
-        .env("_ARGCOMPLETE_", "fish")
-        .env("COMP_LINE", "workset ")
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("Failed to execute binary");
+    let bash_output = bash_complete(temp_dir.path(), "workset ", 8);
+    let fish_output = fish_complete(temp_dir.path(), "workset ");
 
     let bash_stdout = String::from_utf8(bash_output.stdout).unwrap();
     let fish_stdout = String::from_utf8(fish_output.stdout).unwrap();
@@ -1352,4 +1278,100 @@ fn test_fish_vs_bash_output_format() {
         fish_stdout.trim(),
         "init\tInitialize a workspace in current directory"
     );
+}
+
+#[test]
+fn test_bash_complete_ignores_positional_args() {
+    let temp_dir = setup_test_workspace();
+
+    // A `complete -C` registration invokes the completer with three
+    // positional args: the command name, the current word, and the previous
+    // word. They must not affect completion output.
+    let output = Command::new(get_binary_path())
+        .args(["workset", "", "drop"])
+        .env("_ARGCOMPLETE_", "bash")
+        .env("COMP_LINE", "workset drop ")
+        .env("COMP_POINT", "13")
+        .env("COMP_TYPE", "9")
+        .env("COMP_KEY", "9")
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("Failed to execute binary");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success());
+
+    let completions: Vec<&str> = stdout.trim().split('\n').collect();
+    assert!(completions.contains(&"repo1"));
+    assert!(completions.contains(&"repo2"));
+    assert!(completions.contains(&"subdir/repo3"));
+}
+
+#[test]
+fn test_bash_complete_repo_prefix_filter() {
+    let temp_dir = setup_test_workspace();
+
+    // Completing "workset drop re" - bash inserts our output verbatim, so
+    // only candidates matching the current word may be returned
+    let output = bash_complete(temp_dir.path(), "workset drop re", 15);
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success());
+    assert_eq!(stdout.trim(), "repo1\nrepo2");
+}
+
+#[test]
+fn test_bash_complete_multibyte_comp_point() {
+    let temp_dir = setup_test_workspace();
+
+    // "workset drop héllo": 'é' occupies bytes 14-15. Bash's COMP_POINT can
+    // land inside a multibyte character; the completer must not panic.
+    let output = bash_complete(temp_dir.path(), "workset drop héllo", 15);
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_bash_complete_comp_point_beyond_line() {
+    let temp_dir = setup_test_workspace();
+
+    // Bash's COMP_POINT can exceed the byte length of COMP_LINE when the line
+    // contains multibyte characters; the completer must clamp it, not panic
+    let output = bash_complete(temp_dir.path(), "workset drop ", 999);
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let completions: Vec<&str> = stdout.trim().split('\n').collect();
+    assert!(completions.contains(&"repo1"));
+    assert!(completions.contains(&"repo2"));
+    assert!(completions.contains(&"subdir/repo3"));
+}
+
+#[test]
+fn test_fish_complete_partial_repo_token() {
+    let temp_dir = setup_test_workspace();
+
+    // Fish truncates the line at the cursor: "workset drop re". Unlike bash,
+    // fish filters candidates by the current token itself, so all repos are
+    // returned.
+    let output = fish_complete(temp_dir.path(), "workset drop re");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success());
+
+    let repo_names: Vec<&str> = stdout
+        .trim()
+        .split('\n')
+        .map(|line| line.split('\t').next().unwrap())
+        .collect();
+    assert_eq!(repo_names, vec!["repo1", "repo2", "subdir/repo3"]);
 }
