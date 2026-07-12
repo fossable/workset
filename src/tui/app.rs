@@ -11,7 +11,7 @@ pub enum AppMode {
     CloneRepo,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Section {
     Workspace,
     Library,
@@ -43,6 +43,11 @@ pub struct App {
     pub clone_repo_input: String,
     pub clone_repo_suggestions: Vec<String>,
     pub clone_repo_state: TreeState,
+    pub suggestions_loading: bool,
+    /// Whether the current selection was made automatically (not by the user).
+    /// Automatic selections may be replaced when repo data is reloaded; user
+    /// selections are preserved.
+    selection_is_auto: bool,
 }
 
 impl App {
@@ -64,12 +69,20 @@ impl App {
             clone_repo_input: String::new(),
             clone_repo_suggestions: Vec::new(),
             clone_repo_state: TreeState::new(),
+            suggestions_loading: false,
+            selection_is_auto: true,
         };
         app.update_repos(workspace_repos, library_repos);
         app
     }
 
     pub fn filter_repos(&mut self) {
+        self.rebuild_filtered();
+        self.select_first_available();
+    }
+
+    /// Rebuild the filtered trees from the repo lists and the current search query
+    fn rebuild_filtered(&mut self) {
         if self.search_query.is_empty() {
             self.filtered_workspace = self.workspace_tree.clone();
             self.filtered_library = self.library_tree.clone();
@@ -96,8 +109,11 @@ impl App {
                 &self.workspace_repos_list,
             );
         }
+    }
 
-        // Reset selection to the first section with items
+    /// Select the first item in the first section that has any, preferring the
+    /// workspace. Marks the selection as automatic.
+    fn select_first_available(&mut self) {
         if !self.filtered_workspace.is_empty() {
             self.select(Section::Workspace, 0);
         } else if !self.filtered_library.is_empty() {
@@ -106,6 +122,7 @@ impl App {
             self.workspace_state.select(None);
             self.library_state.select(None);
         }
+        self.selection_is_auto = true;
     }
 
     pub fn get_flattened_workspace(&self) -> Vec<(&TreeNode, usize, Vec<usize>, String)> {
@@ -148,6 +165,7 @@ impl App {
         let other = self.active_section.other();
         if self.section_len(other) > 0 {
             self.select(other, 0);
+            self.selection_is_auto = false;
         }
     }
 
@@ -166,6 +184,7 @@ impl App {
         if current_len == 0 {
             return;
         }
+        self.selection_is_auto = false;
 
         let selected = match section {
             Section::Workspace => self.workspace_state.selected(),
@@ -249,23 +268,64 @@ impl App {
         update_repo_status_in_tree(&mut self.filtered_library, display_name, status);
     }
 
-    /// Update the app with new repository data (for real-time loading)
+    /// Update the app with new repository data (for real-time loading).
+    /// A selection made by the user is preserved across the update; automatic
+    /// selections are redone so the workspace is preferred once it has repos.
     pub fn update_repos(&mut self, workspace_repos: Vec<RepoInfo>, library_repos: Vec<RepoInfo>) {
-        let workspace_tree = build_tree(workspace_repos.clone());
-        let library_tree = build_library_tree(library_repos.clone(), &workspace_repos);
+        let previous = if self.selection_is_auto {
+            None
+        } else {
+            self.selected_position()
+        };
 
-        self.workspace_tree = workspace_tree.clone();
-        self.library_tree = library_tree.clone();
+        self.workspace_tree = build_tree(workspace_repos.clone());
+        self.library_tree = build_library_tree(library_repos.clone(), &workspace_repos);
         self.workspace_repos_list = workspace_repos;
         self.library_repos_list = library_repos;
-        self.filtered_workspace = workspace_tree;
-        self.filtered_library = library_tree;
+        self.rebuild_filtered();
 
-        // Ensure something is selected if we have repos
-        if self.workspace_state.selected().is_none() && !self.workspace_tree.is_empty() {
-            self.select(Section::Workspace, 0);
-        } else if self.library_state.selected().is_none() && !self.library_tree.is_empty() {
-            self.select(Section::Library, 0);
+        match previous {
+            Some((section, index, path)) => self.restore_selection(section, index, &path),
+            None => self.select_first_available(),
+        }
+    }
+
+    /// The section, index, and full path of the currently selected item
+    fn selected_position(&self) -> Option<(Section, usize, String)> {
+        let (trees, state) = match self.active_section {
+            Section::Workspace => (&self.filtered_workspace, &self.workspace_state),
+            Section::Library => (&self.filtered_library, &self.library_state),
+        };
+        let index = state.selected()?;
+        let path = flatten_trees(trees)
+            .get(index)
+            .map(|(_, _, _, path)| path.clone())?;
+        Some((self.active_section, index, path))
+    }
+
+    /// Re-select the item with the given full path, checking both sections so
+    /// the selection follows a repo that was dropped or restored. Falls back to
+    /// the nearest index in the previous section.
+    fn restore_selection(&mut self, prev_section: Section, prev_index: usize, path: &str) {
+        for section in [prev_section, prev_section.other()] {
+            let trees = match section {
+                Section::Workspace => &self.filtered_workspace,
+                Section::Library => &self.filtered_library,
+            };
+            if let Some(index) = flatten_trees(trees)
+                .iter()
+                .position(|(_, _, _, p)| p == path)
+            {
+                self.select(section, index);
+                return;
+            }
+        }
+
+        let len = self.section_len(prev_section);
+        if len > 0 {
+            self.select(prev_section, prev_index.min(len - 1));
+        } else {
+            self.select_first_available();
         }
     }
 }
@@ -282,5 +342,118 @@ fn update_repo_status_in_tree(
             repo.operation_status = status.clone();
         }
         update_repo_status_in_tree(&mut node.children, display_name, status.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn repo(display_name: &str) -> RepoInfo {
+        RepoInfo {
+            path: PathBuf::from(display_name),
+            display_name: display_name.to_string(),
+            is_clean: true,
+            modification_time: None,
+            size_bytes: None,
+            operation_status: super::super::tree::RepoOperationStatus::None,
+            is_submodule: false,
+            submodule_initialized: false,
+            parent_repo_path: None,
+        }
+    }
+
+    fn selected_path(app: &App) -> Option<String> {
+        app.selected_position().map(|(_, _, path)| path)
+    }
+
+    #[test]
+    fn auto_selection_prefers_workspace_once_it_loads() {
+        // Library results arrive first (parallel loading is unordered)
+        let mut app = App::new(Vec::new(), vec![repo("github.com/bar/lib")]);
+        assert_eq!(app.active_section, Section::Library);
+
+        // Workspace results arrive later; the automatic selection moves over
+        app.update_repos(
+            vec![repo("github.com/foo/app")],
+            vec![repo("github.com/bar/lib")],
+        );
+        assert_eq!(app.active_section, Section::Workspace);
+
+        // Further streaming updates keep it in the workspace
+        app.update_repos(
+            vec![repo("github.com/foo/app"), repo("github.com/foo/other")],
+            vec![repo("github.com/bar/lib")],
+        );
+        assert_eq!(app.active_section, Section::Workspace);
+    }
+
+    #[test]
+    fn user_selection_survives_streaming_updates() {
+        let mut app = App::new(
+            vec![repo("github.com/foo/app")],
+            vec![repo("github.com/bar/lib")],
+        );
+
+        // User moves into the library
+        app.switch_section();
+        assert_eq!(app.active_section, Section::Library);
+        let path = selected_path(&app).unwrap();
+
+        // More workspace repos stream in; the selection must not jump back
+        app.update_repos(
+            vec![repo("github.com/foo/app"), repo("github.com/foo/other")],
+            vec![repo("github.com/bar/lib")],
+        );
+        assert_eq!(app.active_section, Section::Library);
+        assert_eq!(selected_path(&app).as_deref(), Some(path.as_str()));
+    }
+
+    #[test]
+    fn selection_follows_item_when_siblings_shift() {
+        let mut app = App::new(
+            vec![repo("github.com/foo/app"), repo("github.com/foo/zeta")],
+            Vec::new(),
+        );
+
+        // Move down to a specific repo
+        app.next();
+        app.next();
+        let path = selected_path(&app).unwrap();
+
+        // A new repo is inserted above it in the tree
+        app.update_repos(
+            vec![
+                repo("github.com/aaa/first"),
+                repo("github.com/foo/app"),
+                repo("github.com/foo/zeta"),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(selected_path(&app).as_deref(), Some(path.as_str()));
+    }
+
+    #[test]
+    fn selection_follows_repo_across_sections() {
+        let mut app = App::new(
+            vec![repo("github.com/foo/app")],
+            vec![repo("github.com/bar/lib")],
+        );
+
+        // User selects the library repo (a leaf, two levels deep)
+        app.switch_section();
+        app.next();
+        app.next();
+        let path = selected_path(&app).unwrap();
+        assert_eq!(path, "github.com/bar/lib");
+
+        // The repo is restored into the workspace
+        app.update_repos(
+            vec![repo("github.com/foo/app"), repo("github.com/bar/lib")],
+            Vec::new(),
+        );
+        assert_eq!(app.active_section, Section::Workspace);
+        assert_eq!(selected_path(&app).as_deref(), Some(path.as_str()));
     }
 }

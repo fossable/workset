@@ -27,7 +27,7 @@ use ratatui::{
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, mpsc};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -38,6 +38,100 @@ enum Action {
     RestoreFromLibrary(Vec<String>),
     CloneRepo(String),
     RefreshData,
+}
+
+/// Results streamed from the background repo scan
+enum LoadEvent {
+    Total(usize),
+    Workspace(Vec<RepoInfo>),
+    Library(RepoInfo),
+}
+
+/// A repo scan running on background threads. Results are drained into the
+/// `App` from the event loop via `poll`, so the UI stays responsive.
+struct RepoLoader {
+    rx: mpsc::Receiver<LoadEvent>,
+    workspace_repos: Vec<RepoInfo>,
+    library_repos: Vec<RepoInfo>,
+    done: usize,
+    total: usize,
+    last_name: String,
+    /// Show partial results as they arrive (initial load); otherwise the app
+    /// keeps its current data until the scan completes (background refresh).
+    progressive: bool,
+}
+
+impl RepoLoader {
+    fn start(workspace: &Workspace, progressive: bool) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let workspace = workspace.clone();
+        std::thread::spawn(move || scan_all_repos(&workspace, tx));
+        Self {
+            rx,
+            workspace_repos: Vec::new(),
+            library_repos: Vec::new(),
+            done: 0,
+            total: 0,
+            last_name: String::new(),
+            progressive,
+        }
+    }
+
+    /// Drain any newly scanned repos into the app without blocking.
+    /// Returns false once the scan has finished.
+    fn poll(&mut self, app: &mut App) -> bool {
+        let mut received = false;
+        let finished = loop {
+            match self.rx.try_recv() {
+                Ok(LoadEvent::Total(total)) => self.total = total,
+                Ok(LoadEvent::Workspace(infos)) => {
+                    if let Some(info) = infos.first() {
+                        self.last_name = info.display_name.clone();
+                    }
+                    self.workspace_repos.extend(infos);
+                    self.done += 1;
+                    received = true;
+                }
+                Ok(LoadEvent::Library(info)) => {
+                    self.last_name = info.display_name.clone();
+                    self.library_repos.push(info);
+                    self.done += 1;
+                    received = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => break false,
+                Err(mpsc::TryRecvError::Disconnected) => break true,
+            }
+        };
+
+        if finished {
+            app.update_repos(
+                std::mem::take(&mut self.workspace_repos),
+                std::mem::take(&mut self.library_repos),
+            );
+            if self.progressive {
+                app.last_log_message.clear();
+            }
+        } else if received && self.progressive {
+            app.update_repos(self.workspace_repos.clone(), self.library_repos.clone());
+            let spinner = SPINNER_FRAMES[self.done % SPINNER_FRAMES.len()];
+            app.last_log_message = format!(
+                "{} Loading: {} ({}/{})",
+                spinner, self.last_name, self.done, self.total
+            );
+        }
+
+        !finished
+    }
+}
+
+/// Handles to work running on background threads, drained by the event loop
+struct BackgroundTasks {
+    loader: Option<RepoLoader>,
+    suggestions: Option<mpsc::Receiver<Vec<String>>>,
+    clone_result: Option<mpsc::Receiver<String>>,
+    /// Delivers the file watcher once its (potentially slow) recursive
+    /// registration of the workspace tree completes
+    watcher: Option<mpsc::Receiver<Result<FileWatcher, notify::Error>>>,
 }
 
 /// Detect the parent shell by reading /proc/self/status
@@ -81,34 +175,33 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        // Create app with empty data initially
+        // Create app with empty data; repos stream in from the background loader
         let mut app = App::new(Vec::new(), Vec::new());
-        app.last_log_message = "Initializing...".to_string();
-        terminal.draw(|f| ui(f, &mut app))?;
+        app.last_log_message = "Loading repositories...".to_string();
 
-        // Collect repositories with progress visible, throttling redraws
-        let mut last_draw = Instant::now();
-        let (workspace_repos, library_repos) =
-            collect_repos(workspace, |message, workspace_repos, library_repos| {
-                if last_draw.elapsed() >= Duration::from_millis(50) {
-                    last_draw = Instant::now();
-                    app.last_log_message = message.to_string();
-                    app.update_repos(workspace_repos.to_vec(), library_repos.to_vec());
-                    let _ = terminal.draw(|f| ui(f, &mut app));
-                }
-            });
-
-        // Final update with all collected data
-        app.update_repos(workspace_repos, library_repos);
-        app.last_log_message.clear();
-
-        // Setup filesystem watcher with debouncing
+        // Setup the debounced filesystem watcher on a background thread, since
+        // recursively registering a large workspace can take a while and would
+        // delay the first frame
         let workspace_path = PathBuf::from(&workspace.path);
-        let mut file_watcher = FileWatcher::new(&workspace_path, Duration::from_millis(500))?;
+        let (watcher_tx, watcher_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = watcher_tx.send(FileWatcher::new(
+                &workspace_path,
+                Duration::from_millis(500),
+            ));
+        });
+        let mut file_watcher: Option<FileWatcher> = None;
+
+        let mut background = BackgroundTasks {
+            loader: Some(RepoLoader::start(workspace, true)),
+            suggestions: None,
+            clone_result: None,
+            watcher: Some(watcher_rx),
+        };
 
         // Inner loop to handle actions without tearing down terminal
         loop {
-            let action = run_app(&mut terminal, &mut app, &mut file_watcher)?;
+            let action = run_app(&mut terminal, &mut app, &mut file_watcher, &mut background)?;
 
             // Handle the action
             match action {
@@ -163,7 +256,8 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                         },
                         "Dropped",
                     )?;
-                    reload_app(workspace, &mut app, message);
+                    app.last_log_message = message;
+                    background.loader = Some(RepoLoader::start(workspace, false));
                 }
                 Action::RestoreFromLibrary(repo_paths) => {
                     let message = run_repo_operation(
@@ -174,28 +268,32 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                         |repo_path| workspace.restore_from_library(repo_path),
                         "Restored",
                     )?;
-                    reload_app(workspace, &mut app, message);
+                    app.last_log_message = message;
+                    background.loader = Some(RepoLoader::start(workspace, false));
                 }
                 Action::CloneRepo(repo_pattern) => {
                     app.last_log_message = format!("Cloning repository {}...", repo_pattern);
-                    // Force a redraw to show the message immediately
-                    terminal.draw(|f| ui(f, &mut app))?;
 
-                    let Ok(pattern) = repo_pattern.parse::<RepoPattern>();
-
-                    // Clone the repository
-                    app.last_log_message = match workspace.open(&pattern) {
-                        Ok(_) => format!("Cloned repository {}", repo_pattern),
-                        Err(e) => format!("Failed to clone: {}", e),
-                    };
+                    // Clone on a background thread; the file watcher picks up
+                    // the new repo and triggers a refresh when it lands
+                    let (tx, rx) = mpsc::channel();
+                    background.clone_result = Some(rx);
+                    let workspace = workspace.clone();
+                    std::thread::spawn(move || {
+                        let Ok(pattern) = repo_pattern.parse::<RepoPattern>();
+                        let message = match workspace.open(&pattern) {
+                            Ok(_) => format!("Cloned repository {}", repo_pattern),
+                            Err(e) => format!("Failed to clone: {}", e),
+                        };
+                        let _ = tx.send(message);
+                    });
                 }
                 Action::RefreshData => {
-                    // Filesystem changed - reload repository data
-                    let message = std::mem::take(&mut app.last_log_message);
-                    reload_app(workspace, &mut app, message);
-
-                    // Drain events generated by the refresh to prevent feedback loop
-                    file_watcher.drain_pending();
+                    // Filesystem changed - reload repository data in the background
+                    background.loader = Some(RepoLoader::start(workspace, false));
+                    if let Some(watcher) = file_watcher.as_mut() {
+                        watcher.drain_pending();
+                    }
                 }
             }
         }
@@ -251,25 +349,58 @@ fn run_repo_operation<B: ratatui::backend::Backend>(
     })
 }
 
-/// Reload repository data and rebuild the app state
-fn reload_app(workspace: &Workspace, app: &mut App, message: String) {
-    let (workspace_repos, library_repos) = collect_repos(workspace, |_, _, _| {});
-    *app = App::new(workspace_repos, library_repos);
-    app.last_log_message = message;
-}
-
 fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
-    file_watcher: &mut FileWatcher,
+    file_watcher: &mut Option<FileWatcher>,
+    background: &mut BackgroundTasks,
 ) -> Result<Action> {
     loop {
+        // Apply results from background work before drawing
+        if let Some(rx) = &background.watcher {
+            match rx.try_recv() {
+                Ok(Ok(watcher)) => {
+                    *file_watcher = Some(watcher);
+                    background.watcher = None;
+                }
+                Ok(Err(e)) => {
+                    app.last_log_message = format!("File watching disabled: {}", e);
+                    background.watcher = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => background.watcher = None,
+            }
+        }
+        if let Some(loader) = background.loader.as_mut()
+            && !loader.poll(app)
+        {
+            background.loader = None;
+            // Drain events generated by the scan to prevent a feedback loop
+            if let Some(watcher) = file_watcher.as_mut() {
+                watcher.drain_pending();
+            }
+        }
+        poll_suggestions(app, background);
+        if let Some(rx) = &background.clone_result {
+            match rx.try_recv() {
+                Ok(message) => {
+                    app.last_log_message = message;
+                    background.clone_result = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => background.clone_result = None,
+            }
+        }
+
         terminal
             .draw(|f| ui(f, app))
             .map_err(|e| anyhow!("Failed to render frame: {}", e))?;
 
-        // Check for filesystem changes
-        if file_watcher.poll_refresh() {
+        // Check for filesystem changes; skip while a reload is already running
+        if background.loader.is_none()
+            && let Some(watcher) = file_watcher.as_mut()
+            && watcher.poll_refresh()
+        {
             return Ok(Action::RefreshData);
         }
 
@@ -299,34 +430,23 @@ fn run_app<B: ratatui::backend::Backend>(
                         app.toggle_expand();
                     }
                     KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        // Ctrl+A = clone repo dialog
+                        // Ctrl+A = clone repo dialog; suggestions arrive from a
+                        // background thread since gh/glab may hit the network
                         app.mode = AppMode::CloneRepo;
                         app.clone_repo_input.clear();
+                        app.clone_repo_suggestions.clear();
+                        app.clone_repo_state.select(None);
+                        app.suggestions_loading = true;
 
-                        // Fetch suggestions in background (blocking for now)
-                        let mut suggestions = Vec::new();
-                        suggestions.extend(get_github_suggestions());
-                        suggestions.extend(get_gitlab_suggestions());
-                        suggestions.sort();
-                        suggestions.dedup();
-
-                        // Filter out repos that already exist in workspace or library
-                        let existing_repos: std::collections::HashSet<String> = app
-                            .get_flattened_workspace()
-                            .iter()
-                            .chain(app.get_flattened_library().iter())
-                            .filter_map(|(node, _, _, _)| {
-                                node.repo_info.as_ref().map(|r| r.display_name.clone())
-                            })
-                            .collect();
-
-                        suggestions.retain(|s| !existing_repos.contains(s));
-
-                        app.clone_repo_suggestions = suggestions;
-
-                        if !app.clone_repo_suggestions.is_empty() {
-                            app.clone_repo_state.select(Some(0));
-                        }
+                        let (tx, rx) = mpsc::channel();
+                        background.suggestions = Some(rx);
+                        std::thread::spawn(move || {
+                            let mut suggestions = get_github_suggestions();
+                            suggestions.extend(get_gitlab_suggestions());
+                            suggestions.sort();
+                            suggestions.dedup();
+                            let _ = tx.send(suggestions);
+                        });
                     }
                     KeyCode::Esc => {
                         // Return None to exit - cleanup happens in the outer loop
@@ -426,6 +546,39 @@ fn run_app<B: ratatui::backend::Backend>(
                     _ => {}
                 },
             }
+        }
+    }
+}
+
+/// Apply clone-dialog suggestions once the background fetch completes
+fn poll_suggestions(app: &mut App, background: &mut BackgroundTasks) {
+    let Some(rx) = &background.suggestions else {
+        return;
+    };
+    match rx.try_recv() {
+        Ok(mut suggestions) => {
+            // Filter out repos that already exist in workspace or library
+            let existing_repos: std::collections::HashSet<String> = app
+                .get_flattened_workspace()
+                .iter()
+                .chain(app.get_flattened_library().iter())
+                .filter_map(|(node, _, _, _)| {
+                    node.repo_info.as_ref().map(|r| r.display_name.clone())
+                })
+                .collect();
+            suggestions.retain(|s| !existing_repos.contains(s));
+
+            app.clone_repo_suggestions = suggestions;
+            if !app.clone_repo_suggestions.is_empty() && app.clone_repo_state.selected().is_none() {
+                app.clone_repo_state.select(Some(0));
+            }
+            app.suggestions_loading = false;
+            background.suggestions = None;
+        }
+        Err(mpsc::TryRecvError::Empty) => {}
+        Err(mpsc::TryRecvError::Disconnected) => {
+            app.suggestions_loading = false;
+            background.suggestions = None;
         }
     }
 }
@@ -738,11 +891,16 @@ fn render_clone_repo_dialog(f: &mut Frame, app: &App) {
         .map(|s| ListItem::new(*s))
         .collect();
 
+    let suggestions_title = if app.suggestions_loading {
+        format!("Suggestions ({}) - loading...", filtered_suggestions.len())
+    } else {
+        format!("Suggestions ({})", filtered_suggestions.len())
+    };
     let suggestions = List::new(suggestion_items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!("Suggestions ({})", filtered_suggestions.len())),
+                .title(suggestions_title),
         )
         .highlight_style(
             Style::default()
@@ -922,26 +1080,27 @@ fn scan_library_repo(library_path: &str, repo_path: String) -> RepoInfo {
     }
 }
 
-/// Collect workspace and library repositories with metadata, scanning repos in
-/// parallel. `on_progress` is invoked on the calling thread as results arrive
-/// with a progress message and the repos collected so far.
-fn collect_repos(
-    workspace: &Workspace,
-    mut on_progress: impl FnMut(&str, &[RepoInfo], &[RepoInfo]),
-) -> (Vec<RepoInfo>, Vec<RepoInfo>) {
+/// Enumerate and scan all workspace and library repositories on worker
+/// threads, streaming results to the UI thread. Runs on a background thread;
+/// exits early if the receiver is dropped.
+fn scan_all_repos(workspace: &Workspace, tx: mpsc::Sender<LoadEvent>) {
     enum ScanTask {
         Workspace(PathBuf),
         Library(String),
-    }
-    enum Scanned {
-        Workspace(Vec<RepoInfo>),
-        Library(RepoInfo),
     }
 
     let workspace_paths = find_git_repositories(Path::new(&workspace.path)).unwrap_or_default();
     let library_paths = workspace.list_library().unwrap_or_default();
     let library_path = workspace.library_path();
-    let total = workspace_paths.len() + library_paths.len();
+
+    if tx
+        .send(LoadEvent::Total(
+            workspace_paths.len() + library_paths.len(),
+        ))
+        .is_err()
+    {
+        return;
+    }
 
     let tasks: Mutex<Vec<ScanTask>> = Mutex::new(
         workspace_paths
@@ -956,12 +1115,7 @@ fn collect_repos(
         .unwrap_or(4)
         .min(8);
 
-    let mut workspace_repos = Vec::new();
-    let mut library_repos = Vec::new();
-
     std::thread::scope(|scope| {
-        let (tx, rx) = mpsc::channel();
-
         for _ in 0..workers {
             let tx = tx.clone();
             let tasks = &tasks;
@@ -973,45 +1127,21 @@ fn collect_repos(
                     let Some(task) = task else {
                         break;
                     };
-                    let result = match task {
+                    let event = match task {
                         ScanTask::Workspace(path) => {
-                            Scanned::Workspace(scan_workspace_repo(workspace_path, path))
+                            LoadEvent::Workspace(scan_workspace_repo(workspace_path, path))
                         }
                         ScanTask::Library(repo_path) => {
-                            Scanned::Library(scan_library_repo(library_path, repo_path))
+                            LoadEvent::Library(scan_library_repo(library_path, repo_path))
                         }
                     };
-                    if tx.send(result).is_err() {
+                    if tx.send(event).is_err() {
                         break;
                     }
                 }
             });
         }
-        drop(tx);
-
-        // Drain results on this thread, reporting progress as they arrive
-        let mut done = 0;
-        while let Ok(result) = rx.recv() {
-            done += 1;
-            let name = match &result {
-                Scanned::Workspace(infos) => infos
-                    .first()
-                    .map(|r| r.display_name.clone())
-                    .unwrap_or_default(),
-                Scanned::Library(info) => info.display_name.clone(),
-            };
-            match result {
-                Scanned::Workspace(infos) => workspace_repos.extend(infos),
-                Scanned::Library(info) => library_repos.push(info),
-            }
-
-            let spinner = SPINNER_FRAMES[done % SPINNER_FRAMES.len()];
-            let message = format!("{} Loading: {} ({}/{})", spinner, name, done, total);
-            on_progress(&message, &workspace_repos, &library_repos);
-        }
     });
-
-    (workspace_repos, library_repos)
 }
 
 /// Get the configured GitHub hostname from gh CLI

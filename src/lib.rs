@@ -473,7 +473,7 @@ fn scan_worktree_changes(
 ///     <workspace path>/github.com/fossable/workset
 ///
 /// Workspace root is identified by the presence of a .workset/ directory.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Workspace {
     /// The workspace directory's filesystem path
     pub path: String,
