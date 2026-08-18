@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+
+## Create a git repository at $1 containing $2 commits (default 1)
+createRepo() {
+	mkdir -p "$1"
+	git -C "$1" init -q -b main
+	git -C "$1" config user.email test@example.com
+	git -C "$1" config user.name "Test User"
+	i=0
+	while [ "$i" -lt "${2:-1}" ]; do
+		echo "content $i" >"$1/file$i.txt"
+		git -C "$1" add "file$i.txt"
+		git -C "$1" commit -q -m "commit $i"
+		i=$((i + 1))
+	done
+}
+
+## Initialize a workspace in a subdirectory and move into it. Tests start in
+## the project directory, which is itself a git repository, so the workspace
+## can't live there.
+newWorkspace() {
+	mkdir ws
+	cd ws
+	workset init
+}
+
+## Initializing a workspace creates the library and is idempotent
+testInit() {
+	mkdir ws
+	cd ws
+
+	workset init
+	[ -d .workset ]
+
+	workset init
+	[ -d .workset ]
+}
+
+## A clean repo moves to the library and comes back with its files
+testDropAndRestore() {
+	newWorkspace
+	createRepo test-repo 3
+
+	workset drop test-repo
+	[ ! -e test-repo ]
+	[ -d .workset/test-repo ]
+
+	workset restore test-repo
+	[ -d test-repo/.git ]
+	[ -f test-repo/file0.txt ]
+	[ -f test-repo/file1.txt ]
+	[ -f test-repo/file2.txt ]
+}
+
+## A repo with uncommitted changes is left where it is. Note workset only
+## warns about this, so the assertion is on the filesystem, not the exit code.
+testDropRefusesDirtyRepo() {
+	newWorkspace
+	createRepo dirty-repo 2
+	echo "uncommitted changes" >dirty-repo/dirty.txt
+
+	workset drop dirty-repo
+
+	[ -d dirty-repo/.git ]
+	[ ! -e .workset/dirty-repo ]
+}
+
+## --force drops a repo despite its uncommitted changes
+testDropDirtyRepoWithForce() {
+	newWorkspace
+	createRepo dirty-repo 2
+	echo "uncommitted changes" >dirty-repo/dirty.txt
+
+	workset drop --force dirty-repo
+
+	[ ! -e dirty-repo ]
+	[ -d .workset/dirty-repo ]
+}
+
+## --delete removes a repo instead of storing it in the library
+testDropWithDelete() {
+	newWorkspace
+	createRepo delete-me 1
+
+	workset drop --delete delete-me
+
+	[ ! -e delete-me ]
+	[ ! -e .workset/delete-me ]
+}
+
+## Without a pattern, every repo in the current directory is dropped
+testDropAll() {
+	newWorkspace
+	createRepo repo1
+	createRepo repo2
+	createRepo repo3
+
+	workset drop
+
+	[ ! -e repo1 ]
+	[ ! -e repo2 ]
+	[ ! -e repo3 ]
+	[ -d .workset/repo1 ]
+	[ -d .workset/repo2 ]
+	[ -d .workset/repo3 ]
+}
+
+## Dropping everything only reaches repos under the current directory
+testDropAllFromSubdirectory() {
+	newWorkspace
+	createRepo projects/repo1
+	createRepo projects/repo2
+	createRepo root-repo
+
+	cd projects
+	workset drop
+
+	[ ! -e repo1 ]
+	[ ! -e repo2 ]
+	[ -d ../root-repo ]
+	[ -d ../.workset/projects/repo1 ]
+	[ -d ../.workset/projects/repo2 ]
+}
+
+## Repos nested under a provider path keep their path in the library
+testDropAndRestoreNestedRepo() {
+	newWorkspace
+	createRepo github.com/testuser/nested-repo 2
+
+	workset drop github.com/testuser/nested-repo
+	[ ! -e github.com/testuser/nested-repo ]
+	[ -d .workset/github.com/testuser/nested-repo ]
+
+	workset restore github.com/testuser/nested-repo
+	[ -d github.com/testuser/nested-repo/.git ]
+}
+
+## Drop patterns are workspace-relative, so a full path works from anywhere
+testDropFullPathFromSubdirectory() {
+	newWorkspace
+	createRepo github.com/user/project
+
+	cd github.com/user
+	workset drop github.com/user/project
+
+	[ ! -e project ]
+	[ -d ../../.workset/github.com/user/project ]
+}
+
+## Restore matches library paths by substring, so a bare repo name is enough
+testRestoreFromSubdirectory() {
+	newWorkspace
+	createRepo projects/my-project
+
+	workset drop projects/my-project
+	[ ! -e projects/my-project ]
+
+	cd projects
+	workset restore my-project
+	[ -d my-project/.git ]
+}
+
+## Repeated drop/restore cycles keep the repo intact
+testRepeatedDropRestoreCycles() {
+	newWorkspace
+	createRepo cycle-repo 1
+
+	for i in 1 2 3; do
+		workset drop cycle-repo
+		[ ! -e cycle-repo ]
+
+		workset restore cycle-repo
+		[ -f cycle-repo/file0.txt ]
+	done
+}
+
+## A repo with submodule config survives a drop/restore round trip
+testDropRepoWithGitmodules() {
+	newWorkspace
+	createRepo main-repo 2
+	printf '[submodule "example"]\n\tpath = sub\n\turl = https://example.com/repo.git\n' >main-repo/.gitmodules
+	git -C main-repo add .gitmodules
+	git -C main-repo commit -q -m "Add submodule config"
+
+	workset drop main-repo
+	workset restore main-repo
+
+	[ -f main-repo/.gitmodules ]
+}
+
+## Listing shows each repo with its status
+testListShowsRepoStatus() {
+	newWorkspace
+	createRepo clean-repo 2
+	createRepo dirty-repo 2
+	echo "uncommitted" >dirty-repo/uncommitted.txt
+
+	output=$(workset list)
+
+	echo "$output" | grep "clean-repo - ✓ clean"
+	echo "$output" | grep "dirty-repo - ⚠ modified"
+}
+
+## Listing covers the whole workspace, not just the current directory
+testListFromSubdirectory() {
+	newWorkspace
+	createRepo root-repo
+	createRepo projects/sub-repo1
+	createRepo projects/sub-repo2
+
+	cd projects
+	output=$(workset list)
+
+	echo "$output" | grep "root-repo"
+	echo "$output" | grep "projects/sub-repo1"
+	echo "$output" | grep "projects/sub-repo2"
+}
+
+## Status summarizes the workspace and its library
+testStatusSummary() {
+	newWorkspace
+	createRepo repo1
+	createRepo repo2
+
+	output=$(workset status)
+
+	echo "$output" | grep "^Workspace: "
+	echo "$output" | grep "^Library: "
+	echo "$output" | grep "Active repositories: 2"
+}
+
+## Status is workspace-wide, regardless of the current directory
+testStatusFromSubdirectory() {
+	newWorkspace
+	createRepo root-repo
+	createRepo projects/sub-repo1
+	createRepo projects/sub-repo2
+
+	cd projects
+	workset status | grep "Active repositories: 3"
+}

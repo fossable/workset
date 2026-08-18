@@ -19,9 +19,15 @@ impl TreeState {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum RepoOperationStatus {
     None,
+    /// A background git status scan is running for this repo
+    Scanning,
+    /// Commits are being mirrored to the repo's other remotes
+    Syncing,
+    /// The last mirror attempt failed or hit a conflict
+    SyncFailed(String),
     Cloning,
     Dropping,
     Restoring,
@@ -33,7 +39,8 @@ pub enum RepoOperationStatus {
 pub struct RepoInfo {
     pub path: PathBuf,
     pub display_name: String,
-    pub is_clean: bool,
+    /// Git status, or None while it hasn't been scanned yet
+    pub status: Option<crate::RepoStatus>,
     /// Modification time (for sorting and display)
     pub modification_time: Option<std::time::SystemTime>,
     /// Size on disk in bytes

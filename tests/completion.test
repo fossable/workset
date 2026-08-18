@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+
+# Shell completion tests. These invoke the binary exactly as a registered
+# shell completion would:
+#
+# - bash exports COMP_LINE (the full command line), COMP_POINT (the cursor's
+#   byte offset), COMP_TYPE (9 = TAB), and COMP_KEY to the completer, and a
+#   `complete -C` registration additionally passes three positional args.
+#   The completer's stdout becomes COMPREPLY verbatim, so the binary must
+#   filter candidates by the word at the cursor.
+# - fish never exports COMP_LINE itself; the registration wrapper passes the
+#   line truncated at the cursor (`commandline --cut-at-cursor`). Fish
+#   filters candidates by the current token, so the binary returns all
+#   candidates for the completion context.
+
+## Send a bash completion request for line $1, cursor at byte $2 (default: end
+## of the line)
+bashComplete() {
+	_ARGCOMPLETE_=bash COMP_LINE="$1" COMP_POINT="${2:-${#1}}" COMP_TYPE=9 COMP_KEY=9 workset
+}
+
+## Send a fish completion request as the fish wrapper would deliver it
+fishComplete() {
+	_ARGCOMPLETE_=fish COMP_LINE="$1" workset
+}
+
+## The subcommands offered inside a workspace
+subcommands() {
+	printf 'clone\nrestore\ndrop\nlist\nls\nstatus\n'
+}
+
+## The same subcommands with the descriptions fish expects
+subcommandsWithDescriptions() {
+	printf 'clone\tClone new repository(ies) to workspace\n'
+	printf 'restore\tRestore repository(ies) from library\n'
+	printf 'drop\tDrop one or more repositories\n'
+	printf 'list\tList all repositories with their status\n'
+	printf 'ls\tList all repositories with their status\n'
+	printf 'status\tShow workspace summary and statistics\n'
+}
+
+## The repos created by setupWorkspace, in completion order
+repos() {
+	printf 'repo1\nrepo2\nsubdir/repo3\n'
+}
+
+## Initialize a workspace holding three repos and move into it
+setupWorkspace() {
+	mkdir ws
+	cd ws
+	workset init
+
+	for repo in repo1 repo2 subdir/repo3; do
+		mkdir -p "$repo"
+		git -C "$repo" init -q -b main
+		git -C "$repo" config user.email test@example.com
+		git -C "$repo" config user.name "Test User"
+		echo "# Test repo" >"$repo/README.md"
+		git -C "$repo" add README.md
+		git -C "$repo" commit -q -m "Initial commit"
+	done
+}
+
+## Move somewhere outside of any workspace. The project directory can't be
+## used because it may itself live inside one.
+leaveWorkspace() {
+	mkdir -p /tmp/not-a-workspace
+	cd /tmp/not-a-workspace
+}
+
+## Outside a workspace, `init` is the only thing worth suggesting
+testBashCompleteWithoutWorkspace() {
+	leaveWorkspace
+
+	[ "$(bashComplete "workset ")" = "init" ]
+}
+
+## Inside a workspace, every subcommand is offered
+testBashCompleteSubcommands() {
+	setupWorkspace
+
+	diff <(bashComplete "workset ") <(subcommands)
+}
+
+## Repos are completed once a subcommand has been typed
+testBashCompleteRepoPaths() {
+	setupWorkspace
+
+	diff <(bashComplete "workset drop ") <(repos)
+}
+
+## The cursor need not be at the end of the line: with "workset dr|op" the
+## user is still typing the subcommand word
+testBashCompleteCursorInMiddle() {
+	setupWorkspace
+
+	[ "$(bashComplete "workset drop" 10)" = "drop" ]
+}
+
+## With the cursor at the end of the command name itself there is nothing to
+## offer; bash completes command names on its own
+testBashCompleteCommandNameItself() {
+	setupWorkspace
+
+	[ -z "$(bashComplete "workset" 7)" ]
+}
+
+## Extra spaces before the cursor don't change the suggestions
+testBashCompleteTrailingSpaces() {
+	setupWorkspace
+
+	diff <(bashComplete "workset   ") <(subcommands)
+}
+
+## Bash inserts our output verbatim, so subcommands are filtered by prefix
+testBashCompleteSubcommandPrefix() {
+	setupWorkspace
+
+	diff <(bashComplete "workset l") <(printf 'list\nls\n')
+}
+
+## Repo candidates are filtered by prefix too
+testBashCompleteRepoPrefix() {
+	setupWorkspace
+
+	diff <(bashComplete "workset drop re") <(printf 'repo1\nrepo2\n')
+}
+
+## Real bash always sets COMP_POINT; without it the cursor is assumed to be at
+## the end of the line
+testBashCompleteWithoutCompPoint() {
+	setupWorkspace
+
+	diff <(_ARGCOMPLETE_=bash COMP_LINE="workset drop " COMP_TYPE=9 COMP_KEY=9 workset) <(repos)
+}
+
+## A `complete -C` registration passes the command name, the current word and
+## the previous word as positional args, which must not affect the output
+testBashCompleteIgnoresPositionalArgs() {
+	setupWorkspace
+
+	diff <(_ARGCOMPLETE_=bash COMP_LINE="workset drop " COMP_POINT=13 COMP_TYPE=9 COMP_KEY=9 \
+		workset workset "" drop) <(repos)
+}
+
+## COMP_POINT can land inside a multibyte character ('é' occupies bytes 14-15
+## of this line); the completer must not panic
+testBashCompleteMultibyteCompPoint() {
+	setupWorkspace
+
+	bashComplete "workset drop héllo" 15
+}
+
+## COMP_POINT can also exceed the byte length of COMP_LINE, and is clamped
+testBashCompleteCompPointBeyondLine() {
+	setupWorkspace
+
+	diff <(bashComplete "workset drop " 999) <(repos)
+}
+
+## Fish gets the same suggestion outside a workspace, with a description
+testFishCompleteWithoutWorkspace() {
+	leaveWorkspace
+
+	diff <(fishComplete "workset ") <(printf 'init\tInitialize a workspace in current directory\n')
+}
+
+## Inside a workspace, every subcommand comes with its description
+testFishCompleteSubcommands() {
+	setupWorkspace
+
+	diff <(fishComplete "workset ") <(subcommandsWithDescriptions)
+}
+
+## Fish filters candidates by the current token, so a partially typed
+## subcommand still gets the full list
+testFishCompletePartialCommand() {
+	setupWorkspace
+
+	diff <(fishComplete "workset dr") <(subcommandsWithDescriptions)
+}
+
+## The bare command name is treated the same way
+testFishCompleteBareCommand() {
+	setupWorkspace
+
+	diff <(fishComplete "workset") <(subcommandsWithDescriptions)
+}
+
+## Repo completions carry the repo's status and modification time
+testFishCompleteRepoPaths() {
+	setupWorkspace
+
+	output=$(fishComplete "workset drop ")
+
+	diff <(echo "$output" | cut -f1) <(repos)
+	[ "$(echo "$output" | cut -f2 | grep -c -E "clean|dirty|unpushed|no commits")" -eq 3 ]
+}
+
+## Repos keep being offered after one has been given, since several can be
+## dropped at once
+testFishCompleteMultipleArgs() {
+	setupWorkspace
+
+	diff <(fishComplete "workset drop repo1 " | cut -f1) <(repos)
+}
+
+## Fish filters partial repo tokens itself, so all repos are returned
+testFishCompletePartialRepoToken() {
+	setupWorkspace
+
+	diff <(fishComplete "workset drop re" | cut -f1) <(repos)
+}
+
+## An unrecognized shell is an error
+testUnsupportedShell() {
+	! _ARGCOMPLETE_=zsh COMP_LINE="workset " workset 2>err.txt
+
+	grep "Unsupported shell type" err.txt
+}

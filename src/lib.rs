@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use tracing::{debug, info, warn};
 
+pub mod sync;
 #[cfg(feature = "tui")]
 pub mod tui;
 
@@ -202,7 +203,7 @@ pub fn gix_clone(url: &str, dest: &Path) -> Result<gix::Repository> {
 }
 
 /// Repository status information
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoStatus {
     /// Repository is clean (has commits, no changes, no unpushed)
     Clean,
@@ -315,10 +316,10 @@ fn check_repo_status_with_handle(repo: &gix::Repository, repo_path: &Path) -> Re
 fn check_unpushed_status(repo: &gix::Repository, head_ref: gix::Reference<'_>) -> RepoStatus {
     let local_branch = head_ref.name();
     let remote_ref_name =
-        match repo.branch_remote_ref_name(local_branch, gix::remote::Direction::Fetch) {
+        match repo.branch_remote_tracking_ref_name(local_branch, gix::remote::Direction::Fetch) {
             Some(Ok(name)) => name,
             Some(Err(e)) => {
-                debug!(error = %e, "Failed to get remote ref");
+                debug!(error = %e, "Failed to get remote tracking ref");
                 return RepoStatus::Clean;
             }
             None => {

@@ -77,8 +77,16 @@ Don't let Github be the only place you store your repos!
 
 **Workset** makes it easy to keep local copies of all of your repos without
 having to sift through them to find the ones you're currently working on.
-Mirroring repos to other hosting providers will be supported in a future
-release.
+
+If a repo has multiple remotes, **workset** mirrors your pushed commits to all
+of them automatically. Push to one remote (from anywhere — inside or outside
+workset) and the others catch up in the background: all shared branches and
+tags are propagated, commits you haven't pushed anywhere are never touched,
+and diverged refs show an error instead of being force-pushed. `workset sync`
+does the same from the command line.
+
+Background pushes never prompt for credentials (SSH runs in batch mode), so
+use an SSH agent or credential helper for remotes that need authentication.
 
 ## Installation
 
@@ -104,3 +112,18 @@ cargo install workset
 `nix-env -i workset`
 
 </details>
+
+### Shell completions
+
+Completion scripts for bash and fish live in [`completions/`](./completions).
+
+```sh
+# Bash: source it from ~/.bashrc (or copy into a bash-completion directory)
+source /path/to/workset/completions/workset.bash
+
+# Fish: copy it where fish autoloads completions
+cp /path/to/workset/completions/workset.fish ~/.config/fish/completions/
+```
+
+Completions are generated dynamically by the `workset` binary itself: `drop`
+suggests repos in your workspace, and `restore` suggests repos in your library.

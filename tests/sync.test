@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+
+## Add a commit touching $2 to the repo at $1
+addCommit() {
+	echo "$2" >"$1/$2"
+	git -C "$1" add "$2"
+	git -C "$1" commit -q -m "$2"
+}
+
+## Initialize a workspace holding `repo` on branch main, with two bare remotes
+## `a` and `b` both seeded with its initial commit; `a` is the upstream of
+## main. The bare remotes live outside the workspace so workset doesn't treat
+## them as repos of their own.
+setupSync() {
+	mkdir remotes
+	remotes=$PWD/remotes
+	git init -q --bare "$remotes/a.git"
+	git init -q --bare "$remotes/b.git"
+
+	mkdir ws
+	cd ws
+	workset init
+
+	mkdir repo
+	git -C repo init -q -b main
+	git -C repo config user.email test@example.com
+	git -C repo config user.name "Test User"
+	addCommit repo initial.txt
+
+	git -C repo remote add a "$remotes/a.git"
+	git -C repo remote add b "$remotes/b.git"
+	git -C repo push -q -u a main
+	git -C repo push -q b main
+}
+
+## A commit the user pushed to one remote is mirrored to the others
+testSyncMirrorsPushedCommit() {
+	setupSync
+	addCommit repo new.txt
+	git -C repo push -q a main
+
+	output=$(workset sync)
+
+	echo "$output" | grep "repo - ✓ pushed main to b"
+	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$(git -C repo rev-parse HEAD)" ]
+	workset list | grep "repo - ✓ clean"
+}
+
+## Commits that exist only locally are never pushed
+testSyncNeverPushesUnpushedCommits() {
+	setupSync
+	seeded=$(git -C repo rev-parse HEAD)
+	addCommit repo local-only.txt
+
+	output=$(workset sync)
+
+	echo "$output" | grep "repo - ✓ in sync"
+	[ "$(git -C "$remotes/a.git" rev-parse main)" = "$seeded" ]
+	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$seeded" ]
+	workset list | grep "repo - ⚠ unpushed"
+}
+
+## A diverged remote is reported rather than force-pushed
+testSyncReportsDivergenceWithoutForcing() {
+	setupSync
+	# Push one commit to b, then abandon it and push a different one to a,
+	# leaving b diverged from the published history
+	addCommit repo abandoned.txt
+	git -C repo push -q b main
+	abandoned=$(git -C repo rev-parse HEAD)
+	git -C repo reset -q --hard HEAD~1
+	addCommit repo kept.txt
+	git -C repo push -q a main
+
+	output=$(workset sync)
+
+	echo "$output" | grep "repo - ⚠ main on b:"
+	! echo "$output" | grep "pushed main to b"
+	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$abandoned" ]
+}
+
+## A branch that was never pushed anywhere is left alone
+testSyncLeavesLocalOnlyBranchAlone() {
+	setupSync
+	git -C repo checkout -q -b feature
+	addCommit repo feature.txt
+	git -C repo checkout -q main
+
+	output=$(workset sync)
+
+	echo "$output" | grep "repo - ✓ in sync"
+	! git -C "$remotes/a.git" rev-parse --verify refs/heads/feature
+	! git -C "$remotes/b.git" rev-parse --verify refs/heads/feature
+}
+
+## Tags are mirrored, and a tag pointing somewhere else is a conflict
+testSyncMirrorsTagsAndReportsMismatch() {
+	setupSync
+	git -C repo tag v1
+	git -C repo push -q a refs/tags/v1
+
+	# b holds a v2 tag pointing at a different commit than the local v2
+	old_head=$(git -C repo rev-parse HEAD)
+	addCommit repo v2.txt
+	git -C repo push -q a main
+	git -C repo tag v2
+	git -C repo push -q a refs/tags/v2
+	git -C "$remotes/b.git" update-ref refs/tags/v2 "$old_head"
+
+	output=$(workset sync)
+
+	echo "$output" | grep "repo - ⚠ v2 on b:"
+	[ "$(git -C "$remotes/b.git" rev-parse refs/tags/v1)" = "$(git -C repo rev-parse refs/tags/v1)" ]
+	[ "$(git -C "$remotes/b.git" rev-parse refs/tags/v2)" = "$old_head" ]
+}
+
+## Syncing refreshes tracking refs, clearing a stale unpushed status
+testSyncRefreshesStaleUnpushedStatus() {
+	setupSync
+	addCommit repo new.txt
+	git -C repo push -q a main
+	git -C repo push -q b main
+
+	# Simulate a stale tracking ref, as if the push happened elsewhere
+	git -C repo update-ref refs/remotes/a/main HEAD~1
+	workset list | grep "repo - ⚠ unpushed"
+
+	workset sync
+
+	workset list | grep "repo - ✓ clean"
+}
+
+## An unreachable remote doesn't stop the reachable ones from being mirrored
+testSyncContinuesPastUnreachableRemote() {
+	setupSync
+	git init -q --bare "$remotes/c.git"
+	git -C repo remote add c "$remotes/c.git"
+	git -C repo push -q c main
+	rm -rf "$remotes/c.git"
+
+	addCommit repo new.txt
+	git -C repo push -q a main
+
+	output=$(workset sync)
+
+	echo "$output" | grep "repo - ✗ fetch c failed"
+	[ "$(git -C "$remotes/b.git" rev-parse main)" = "$(git -C repo rev-parse HEAD)" ]
+}

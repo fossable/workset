@@ -270,6 +270,7 @@ fn main() -> Result<()> {
                                        With --force: drop even with uncommitted changes{reset}
   {subcmd}list{reset}, {subcmd}ls{reset}                             List all repositories with their status
   {subcmd}status{reset}                               Show workspace summary and statistics
+  {subcmd}sync{reset} {arg}[pattern]{reset}                       Mirror pushed commits to all of each repo's remotes
 
 {examples_header}
   {cmd}workset init{reset}                              Initialize workspace here
@@ -400,6 +401,14 @@ fn main() -> Result<()> {
                     error!("Not in a workspace");
                 }
             }
+            "sync" => {
+                if let Some(workspace) = maybe_workspace {
+                    let pattern = args.opt_free_from_str::<String>()?;
+                    sync_repos(&workspace, pattern.as_deref())?;
+                } else {
+                    error!("Not in a workspace");
+                }
+            }
             _ => {
                 error!(command = %command, "Unknown command");
                 error!("Run 'workset --help' for usage information");
@@ -454,6 +463,79 @@ fn list_workspace_status(workspace: &Workspace) -> Result<()> {
         println!("  {} - {}", repo_name, status_str);
     }
 
+    Ok(())
+}
+
+/// Mirror pushed commits across each repo's remotes, printing per-ref results
+fn sync_repos(workspace: &Workspace, pattern: Option<&str>) -> Result<()> {
+    let repos = workset::find_git_repositories(Path::new(&workspace.path))?;
+    let interrupt = std::sync::atomic::AtomicBool::new(false);
+    let short = |refname: &str| {
+        refname
+            .strip_prefix("refs/heads/")
+            .or_else(|| refname.strip_prefix("refs/tags/"))
+            .unwrap_or(refname)
+            .to_string()
+    };
+
+    let mut matched = false;
+    for repo in repos {
+        let repo_name = repo
+            .strip_prefix(&workspace.path)
+            .unwrap_or(&repo)
+            .display()
+            .to_string();
+        if pattern.is_some_and(|p| !repo_name.contains(p)) {
+            continue;
+        }
+        matched = true;
+
+        match workset::sync::sync_repo(&repo, &interrupt) {
+            Ok(outcome) => {
+                for (remote, refname) in &outcome.pushed {
+                    println!(
+                        "  {} - ✓ pushed {} to {}",
+                        repo_name,
+                        short(refname),
+                        remote
+                    );
+                }
+                for (remote, refname, reason) in &outcome.conflicts {
+                    println!(
+                        "  {} - ⚠ {} on {}: {}",
+                        repo_name,
+                        short(refname),
+                        remote,
+                        reason
+                    );
+                }
+                for (remote, refname, error) in &outcome.push_errors {
+                    println!(
+                        "  {} - ✗ push {} to {} failed: {}",
+                        repo_name,
+                        short(refname),
+                        remote,
+                        error
+                    );
+                }
+                for (remote, error) in &outcome.fetch_errors {
+                    println!("  {} - ✗ fetch {} failed: {}", repo_name, remote, error);
+                }
+                if outcome.pushed.is_empty()
+                    && outcome.conflicts.is_empty()
+                    && outcome.push_errors.is_empty()
+                    && outcome.fetch_errors.is_empty()
+                {
+                    println!("  {} - ✓ in sync", repo_name);
+                }
+            }
+            Err(e) => println!("  {} - ✗ sync failed: {}", repo_name, e),
+        }
+    }
+
+    if !matched {
+        println!("No repositories matched");
+    }
     Ok(())
 }
 

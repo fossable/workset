@@ -57,6 +57,9 @@ pub struct App {
     pub clone_repo_state: TreeState,
     pub suggestions_loading: bool,
     pending_clones: Vec<PendingClone>,
+    /// Sync status per repo display name (Syncing or SyncFailed), overlaid on
+    /// the repo rows so it survives background data refreshes
+    sync_statuses: std::collections::HashMap<String, RepoOperationStatus>,
     /// Whether the current selection was made automatically (not by the user).
     /// Automatic selections may be replaced when repo data is reloaded; user
     /// selections are preserved.
@@ -90,6 +93,7 @@ impl App {
             clone_repo_state: TreeState::new(),
             suggestions_loading: false,
             pending_clones: Vec::new(),
+            sync_statuses: std::collections::HashMap::new(),
             selection_is_auto: true,
         };
         app.update_repos(workspace_repos, library_repos);
@@ -108,7 +112,7 @@ impl App {
             self.filtered_library = self.library_tree.clone();
         } else {
             // Filter repos by fuzzy-matching the search query
-            let workspace_repos = self.workspace_repos_with_pending();
+            let workspace_repos = self.workspace_repos_with_overlays();
             let matches = |r: &&RepoInfo| {
                 self.matcher
                     .fuzzy_match(&r.display_name, &self.search_query)
@@ -127,11 +131,22 @@ impl App {
         }
     }
 
-    /// The workspace repos with each pending clone applied: repos that already
-    /// exist on disk (cloning creates the directory right away) get the status
-    /// overlaid; the rest get a synthetic placeholder entry
-    fn workspace_repos_with_pending(&self) -> Vec<RepoInfo> {
+    /// The workspace repos with transient statuses applied: pending clones get
+    /// their status overlaid on existing rows (cloning creates the directory
+    /// right away) or a synthetic placeholder entry, and repos with an active
+    /// sync get their sync status shown
+    fn workspace_repos_with_overlays(&self) -> Vec<RepoInfo> {
         let mut repos = self.workspace_repos_list.clone();
+        for repo in &mut repos {
+            if let Some(status) = self.sync_statuses.get(&repo.display_name)
+                && matches!(
+                    repo.operation_status,
+                    RepoOperationStatus::None | RepoOperationStatus::Scanning
+                )
+            {
+                repo.operation_status = status.clone();
+            }
+        }
         for pending in &self.pending_clones {
             if let Some(repo) = repos
                 .iter_mut()
@@ -145,7 +160,7 @@ impl App {
                         self.workspace_path, pending.display_name
                     )),
                     display_name: pending.display_name.clone(),
-                    is_clean: true,
+                    status: None,
                     modification_time: None,
                     size_bytes: None,
                     operation_status: pending.status.clone(),
@@ -167,7 +182,7 @@ impl App {
             self.selected_position()
         };
 
-        self.workspace_tree = build_tree(self.workspace_repos_with_pending());
+        self.workspace_tree = build_tree(self.workspace_repos_with_overlays());
         self.rebuild_filtered();
 
         match previous {
@@ -389,13 +404,65 @@ impl App {
         self.library_tree = build_library_tree(library_repos.clone(), &workspace_repos);
         self.workspace_repos_list = workspace_repos;
         self.library_repos_list = library_repos;
-        self.workspace_tree = build_tree(self.workspace_repos_with_pending());
+        self.workspace_tree = build_tree(self.workspace_repos_with_overlays());
         self.rebuild_filtered();
 
         match previous {
             Some((section, index, path)) => self.restore_selection(section, index, &path),
             None => self.select_first_available(),
         }
+    }
+
+    /// Overlay a sync status (Syncing or SyncFailed) on the given repo
+    pub fn set_sync_status(&mut self, display_name: &str, status: RepoOperationStatus) {
+        self.sync_statuses.insert(display_name.to_string(), status);
+        self.rebuild_after_pending_change();
+    }
+
+    /// Remove the sync status overlay from the given repo
+    pub fn clear_sync_status(&mut self, display_name: &str) {
+        if self.sync_statuses.remove(display_name).is_some() {
+            self.rebuild_after_pending_change();
+        }
+    }
+
+    /// Apply a freshly computed git status to the given repo's row
+    pub fn apply_scan_result(
+        &mut self,
+        display_name: &str,
+        status: crate::RepoStatus,
+        modification_time: Option<std::time::SystemTime>,
+    ) {
+        if let Some(repo) = self
+            .workspace_repos_list
+            .iter_mut()
+            .find(|r| r.display_name == display_name)
+        {
+            repo.status = Some(status);
+            if modification_time.is_some() {
+                repo.modification_time = modification_time;
+            }
+            self.rebuild_after_pending_change();
+        }
+    }
+
+    /// Paths of the workspace repos that background sync should consider
+    /// (submodules are synced through their parent repo)
+    pub fn syncable_repo_paths(&self) -> Vec<PathBuf> {
+        self.workspace_repos_list
+            .iter()
+            .filter(|r| !r.is_submodule)
+            .map(|r| r.path.clone())
+            .collect()
+    }
+
+    /// Snapshot of the current repo lists, used to seed a background refresh
+    /// so existing rows keep their data while being rescanned
+    pub fn repo_snapshot(&self) -> (Vec<RepoInfo>, Vec<RepoInfo>) {
+        (
+            self.workspace_repos_list.clone(),
+            self.library_repos_list.clone(),
+        )
     }
 
     /// The section, index, and full path of the currently selected item
@@ -462,7 +529,7 @@ mod tests {
         RepoInfo {
             path: PathBuf::from(display_name),
             display_name: display_name.to_string(),
-            is_clean: true,
+            status: Some(crate::RepoStatus::Clean),
             modification_time: None,
             size_bytes: None,
             operation_status: super::super::tree::RepoOperationStatus::None,
@@ -481,6 +548,65 @@ mod tests {
             .iter()
             .map(|(_, _, _, p)| p.clone())
             .collect()
+    }
+
+    fn workspace_repo_info(app: &App, name: &str) -> Option<RepoInfo> {
+        flatten_trees(&app.filtered_workspace)
+            .iter()
+            .find(|(_, _, _, p)| p == name)
+            .and_then(|(node, _, _, _)| node.repo_info.clone())
+    }
+
+    #[test]
+    fn sync_status_overlay_survives_updates() {
+        let mut app = App::new(
+            "workspace".to_string(),
+            vec![repo("github.com/foo/app")],
+            Vec::new(),
+        );
+
+        app.set_sync_status("github.com/foo/app", RepoOperationStatus::Syncing);
+        let info = workspace_repo_info(&app, "github.com/foo/app").unwrap();
+        assert_eq!(info.operation_status, RepoOperationStatus::Syncing);
+
+        // A background rescan rebuilds the rows; the overlay must persist
+        app.update_repos(vec![repo("github.com/foo/app")], Vec::new());
+        let info = workspace_repo_info(&app, "github.com/foo/app").unwrap();
+        assert_eq!(info.operation_status, RepoOperationStatus::Syncing);
+
+        app.set_sync_status(
+            "github.com/foo/app",
+            RepoOperationStatus::SyncFailed("diverged".to_string()),
+        );
+        let info = workspace_repo_info(&app, "github.com/foo/app").unwrap();
+        assert_eq!(
+            info.operation_status,
+            RepoOperationStatus::SyncFailed("diverged".to_string())
+        );
+
+        app.clear_sync_status("github.com/foo/app");
+        let info = workspace_repo_info(&app, "github.com/foo/app").unwrap();
+        assert_eq!(info.operation_status, RepoOperationStatus::None);
+    }
+
+    #[test]
+    fn apply_scan_result_updates_repo_status() {
+        let mut app = App::new(
+            "workspace".to_string(),
+            vec![repo("github.com/foo/app")],
+            Vec::new(),
+        );
+
+        let time = std::time::SystemTime::now();
+        app.apply_scan_result(
+            "github.com/foo/app",
+            crate::RepoStatus::Unpushed,
+            Some(time),
+        );
+
+        let info = workspace_repo_info(&app, "github.com/foo/app").unwrap();
+        assert_eq!(info.status, Some(crate::RepoStatus::Unpushed));
+        assert_eq!(info.modification_time, Some(time));
     }
 
     #[test]

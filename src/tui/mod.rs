@@ -24,12 +24,22 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, mpsc};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// How many repos may sync (fetch/push) concurrently
+const MAX_CONCURRENT_SYNCS: usize = 4;
+/// How often all repos are re-checked against their remotes
+const SYNC_INTERVAL: Duration = Duration::from_secs(300);
+/// Ignore watcher-triggered sync requests this soon after a sync finished,
+/// since the sync's own fetch writes the tracking refs the watcher observes
+const WATCHER_SYNC_COOLDOWN: Duration = Duration::from_secs(2);
 
 enum Action {
     None,
@@ -42,33 +52,56 @@ enum Action {
 
 /// Results streamed from the background repo scan
 enum LoadEvent {
-    Total(usize),
+    /// Fast filesystem enumeration finished: placeholder rows for every repo,
+    /// sent before any git work starts
+    Discovered {
+        workspace: Vec<RepoInfo>,
+        library: Vec<RepoInfo>,
+    },
     Workspace(Vec<RepoInfo>),
     Library(RepoInfo),
 }
 
 /// A repo scan running on background threads. Results are drained into the
 /// `App` from the event loop via `poll`, so the UI stays responsive.
+///
+/// Rows the scan hasn't reached yet are shown with a "scanning" status:
+/// seeded from the app's previous data on a refresh (keeping their last known
+/// status), or as bare placeholders on the initial load.
 struct RepoLoader {
     rx: mpsc::Receiver<LoadEvent>,
-    workspace_repos: Vec<RepoInfo>,
-    library_repos: Vec<RepoInfo>,
+    scanned_workspace: Vec<RepoInfo>,
+    scanned_library: Vec<RepoInfo>,
+    pending_workspace: Vec<RepoInfo>,
+    pending_library: Vec<RepoInfo>,
     done: usize,
     total: usize,
-    /// Show partial results as they arrive (initial load); otherwise the app
-    /// keeps its current data until the scan completes (background refresh).
+    /// Show a spinner with scan progress in the title (initial load)
     progressive: bool,
 }
 
 impl RepoLoader {
-    fn start(workspace: &Workspace, progressive: bool) -> Self {
+    fn start(
+        workspace: &Workspace,
+        seed_workspace: Vec<RepoInfo>,
+        seed_library: Vec<RepoInfo>,
+        progressive: bool,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let workspace = workspace.clone();
         std::thread::spawn(move || scan_all_repos(&workspace, tx));
+        let mark_scanning = |mut repos: Vec<RepoInfo>| {
+            for repo in &mut repos {
+                repo.operation_status = RepoOperationStatus::Scanning;
+            }
+            repos
+        };
         Self {
             rx,
-            workspace_repos: Vec::new(),
-            library_repos: Vec::new(),
+            scanned_workspace: Vec::new(),
+            scanned_library: Vec::new(),
+            pending_workspace: mark_scanning(seed_workspace),
+            pending_library: mark_scanning(seed_library),
             done: 0,
             total: 0,
             progressive,
@@ -81,14 +114,23 @@ impl RepoLoader {
         let mut received = false;
         let finished = loop {
             match self.rx.try_recv() {
-                Ok(LoadEvent::Total(total)) => self.total = total,
+                Ok(LoadEvent::Discovered { workspace, library }) => {
+                    self.total = workspace.len() + library.len();
+                    merge_discovered(&mut self.pending_workspace, workspace);
+                    merge_discovered(&mut self.pending_library, library);
+                    received = true;
+                }
                 Ok(LoadEvent::Workspace(infos)) => {
-                    self.workspace_repos.extend(infos);
+                    self.pending_workspace
+                        .retain(|p| !infos.iter().any(|i| i.display_name == p.display_name));
+                    self.scanned_workspace.extend(infos);
                     self.done += 1;
                     received = true;
                 }
                 Ok(LoadEvent::Library(info)) => {
-                    self.library_repos.push(info);
+                    self.pending_library
+                        .retain(|p| p.display_name != info.display_name);
+                    self.scanned_library.push(info);
                     self.done += 1;
                     received = true;
                 }
@@ -99,19 +141,184 @@ impl RepoLoader {
 
         if finished {
             app.update_repos(
-                std::mem::take(&mut self.workspace_repos),
-                std::mem::take(&mut self.library_repos),
+                std::mem::take(&mut self.scanned_workspace),
+                std::mem::take(&mut self.scanned_library),
             );
             if self.progressive {
                 app.loading_progress = None;
             }
-        } else if received && self.progressive {
-            app.update_repos(self.workspace_repos.clone(), self.library_repos.clone());
-            let spinner = SPINNER_FRAMES[self.done % SPINNER_FRAMES.len()];
-            app.loading_progress = Some(format!("{} {}/{}", spinner, self.done, self.total));
+        } else if received {
+            let workspace = self
+                .scanned_workspace
+                .iter()
+                .chain(&self.pending_workspace)
+                .cloned()
+                .collect();
+            let library = self
+                .scanned_library
+                .iter()
+                .chain(&self.pending_library)
+                .cloned()
+                .collect();
+            app.update_repos(workspace, library);
+            if self.progressive {
+                let spinner = SPINNER_FRAMES[self.done % SPINNER_FRAMES.len()];
+                app.loading_progress = Some(format!("{} {}/{}", spinner, self.done, self.total));
+            }
         }
 
         !finished
+    }
+}
+
+/// Reconcile seeded pending rows with the freshly enumerated repo set: rows
+/// that no longer exist are dropped, newly appeared repos get a placeholder.
+/// Submodule rows are kept as-is; they ride along with their parent's scan.
+fn merge_discovered(pending: &mut Vec<RepoInfo>, discovered: Vec<RepoInfo>) {
+    pending
+        .retain(|p| p.is_submodule || discovered.iter().any(|d| d.display_name == p.display_name));
+    for repo in discovered {
+        if !pending.iter().any(|p| p.display_name == repo.display_name) {
+            pending.push(repo);
+        }
+    }
+}
+
+/// Result of a background sync job for one repo
+enum SyncEvent {
+    Started,
+    Finished(crate::sync::SyncOutcome),
+    Failed(String),
+}
+
+/// Schedules background jobs that mirror each repo's commits across its
+/// remotes. Jobs run on their own threads (up to `MAX_CONCURRENT_SYNCS`) and
+/// report back through a channel drained by the event loop.
+struct SyncManager {
+    tx: mpsc::Sender<(PathBuf, SyncEvent)>,
+    rx: mpsc::Receiver<(PathBuf, SyncEvent)>,
+    queue: VecDeque<PathBuf>,
+    in_flight: HashSet<PathBuf>,
+    /// Repos that were requested again while already syncing; re-queued once
+    /// the running job finishes
+    rerun_after: HashSet<PathBuf>,
+    recently_synced: HashMap<PathBuf, Instant>,
+    last_periodic: Instant,
+    /// Sync every repo once the initial scan completes. Because the outer TUI
+    /// loop rebuilds everything after an interactive shell exits, this covers
+    /// both startup and returning from a shell.
+    startup_pending: bool,
+    interrupt: Arc<AtomicBool>,
+    workspace_path: String,
+}
+
+impl SyncManager {
+    fn new(workspace_path: String) -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            tx,
+            rx,
+            queue: VecDeque::new(),
+            in_flight: HashSet::new(),
+            rerun_after: HashSet::new(),
+            recently_synced: HashMap::new(),
+            last_periodic: Instant::now(),
+            startup_pending: true,
+            interrupt: Arc::new(AtomicBool::new(false)),
+            workspace_path,
+        }
+    }
+
+    /// Queue a repo for syncing, deduplicating against queued and running jobs
+    fn request_sync(&mut self, repo: PathBuf, from_watcher: bool) {
+        if from_watcher
+            && self
+                .recently_synced
+                .get(&repo)
+                .is_some_and(|t| t.elapsed() < WATCHER_SYNC_COOLDOWN)
+        {
+            return;
+        }
+        if self.in_flight.contains(&repo) {
+            self.rerun_after.insert(repo);
+            return;
+        }
+        if !self.queue.contains(&repo) {
+            self.queue.push_back(repo);
+        }
+    }
+
+    /// Queue every syncable workspace repo
+    fn request_sync_all(&mut self, app: &App) {
+        for repo in app.syncable_repo_paths() {
+            self.request_sync(repo, false);
+        }
+    }
+
+    /// Re-check all repos on a timer; skipped while a scan is loading since
+    /// the repo list may be incomplete
+    fn maybe_periodic(&mut self, app: &App, loader_active: bool) {
+        if loader_active || self.last_periodic.elapsed() < SYNC_INTERVAL {
+            return;
+        }
+        self.last_periodic = Instant::now();
+        self.request_sync_all(app);
+    }
+
+    /// Spawn queued jobs up to the concurrency cap
+    fn pump(&mut self) {
+        while self.in_flight.len() < MAX_CONCURRENT_SYNCS {
+            let Some(repo) = self.queue.pop_front() else {
+                break;
+            };
+            self.in_flight.insert(repo.clone());
+            let tx = self.tx.clone();
+            let interrupt = self.interrupt.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send((repo.clone(), SyncEvent::Started));
+                let event = match crate::sync::sync_repo(&repo, &interrupt) {
+                    Ok(outcome) => SyncEvent::Finished(outcome),
+                    Err(e) => SyncEvent::Failed(e.to_string()),
+                };
+                let _ = tx.send((repo, event));
+            });
+        }
+    }
+
+    /// Drain finished jobs into the app without blocking
+    fn poll(&mut self, app: &mut App) {
+        while let Ok((repo, event)) = self.rx.try_recv() {
+            let display_name = workspace_display_name(&self.workspace_path, &repo);
+            match event {
+                SyncEvent::Started => {
+                    app.set_sync_status(&display_name, RepoOperationStatus::Syncing);
+                }
+                SyncEvent::Finished(outcome) => {
+                    self.finish(&repo);
+                    if let Some(status) = outcome.status {
+                        app.apply_scan_result(&display_name, status, outcome.modification_time);
+                    }
+                    match outcome.error_summary() {
+                        Some(err) => {
+                            app.set_sync_status(&display_name, RepoOperationStatus::SyncFailed(err))
+                        }
+                        None => app.clear_sync_status(&display_name),
+                    }
+                }
+                SyncEvent::Failed(err) => {
+                    self.finish(&repo);
+                    app.set_sync_status(&display_name, RepoOperationStatus::SyncFailed(err));
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self, repo: &PathBuf) {
+        self.in_flight.remove(repo);
+        self.recently_synced.insert(repo.clone(), Instant::now());
+        if self.rerun_after.remove(repo) {
+            self.queue.push_back(repo.clone());
+        }
     }
 }
 
@@ -125,6 +332,8 @@ struct BackgroundTasks {
     /// Delivers the file watcher once its (potentially slow) recursive
     /// registration of the workspace tree completes
     watcher: Option<mpsc::Receiver<Result<FileWatcher, notify::Error>>>,
+    /// Mirrors commits across each repo's remotes
+    sync: SyncManager,
 }
 
 /// Detect the parent shell by reading /proc/self/status
@@ -186,10 +395,11 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
         let mut file_watcher: Option<FileWatcher> = None;
 
         let mut background = BackgroundTasks {
-            loader: Some(RepoLoader::start(workspace, true)),
+            loader: Some(RepoLoader::start(workspace, Vec::new(), Vec::new(), true)),
             suggestions: None,
             clone_result: None,
             watcher: Some(watcher_rx),
+            sync: SyncManager::new(workspace.path.clone()),
         };
 
         // Inner loop to handle actions without tearing down terminal
@@ -199,6 +409,9 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
             // Handle the action
             match action {
                 Action::None => {
+                    // Stop in-flight sync jobs between git invocations
+                    background.sync.interrupt.store(true, Ordering::Relaxed);
+
                     // Drain any pending events before cleanup to avoid issues
                     while event::poll(Duration::from_millis(0))? {
                         let _ = event::read()?;
@@ -248,7 +461,13 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                             workspace.drop(&pattern, false, false)
                         },
                     )?;
-                    background.loader = Some(RepoLoader::start(workspace, false));
+                    let (seed_workspace, seed_library) = app.repo_snapshot();
+                    background.loader = Some(RepoLoader::start(
+                        workspace,
+                        seed_workspace,
+                        seed_library,
+                        false,
+                    ));
                 }
                 Action::RestoreFromLibrary(repo_paths) => {
                     run_repo_operation(
@@ -258,7 +477,13 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                         RepoOperationStatus::Restoring,
                         |repo_path| workspace.restore_from_library(repo_path),
                     )?;
-                    background.loader = Some(RepoLoader::start(workspace, false));
+                    let (seed_workspace, seed_library) = app.repo_snapshot();
+                    background.loader = Some(RepoLoader::start(
+                        workspace,
+                        seed_workspace,
+                        seed_library,
+                        false,
+                    ));
                 }
                 Action::CloneRepo(repo_pattern) => {
                     // Show a placeholder repo row while the clone runs
@@ -277,7 +502,13 @@ pub fn run_tui(workspace: &Workspace) -> Result<()> {
                 }
                 Action::RefreshData => {
                     // Filesystem changed - reload repository data in the background
-                    background.loader = Some(RepoLoader::start(workspace, false));
+                    let (seed_workspace, seed_library) = app.repo_snapshot();
+                    background.loader = Some(RepoLoader::start(
+                        workspace,
+                        seed_workspace,
+                        seed_library,
+                        false,
+                    ));
                     if let Some(watcher) = file_watcher.as_mut() {
                         watcher.drain_pending();
                     }
@@ -353,7 +584,16 @@ fn run_app<B: ratatui::backend::Backend>(
             if let Some(watcher) = file_watcher.as_mut() {
                 watcher.drain_pending();
             }
+            // Check every repo against its remotes once the first scan lands
+            if background.sync.startup_pending {
+                background.sync.startup_pending = false;
+                background.sync.request_sync_all(app);
+            }
         }
+        let loader_active = background.loader.is_some();
+        background.sync.poll(app);
+        background.sync.maybe_periodic(app, loader_active);
+        background.sync.pump();
         poll_suggestions(app, background);
         if let Some((pattern, rx)) = &background.clone_result {
             match rx.try_recv() {
@@ -376,12 +616,17 @@ fn run_app<B: ratatui::backend::Backend>(
             .draw(|f| ui(f, app))
             .map_err(|e| anyhow!("Failed to render frame: {}", e))?;
 
-        // Check for filesystem changes; skip while a reload is already running
-        if background.loader.is_none()
-            && let Some(watcher) = file_watcher.as_mut()
-            && watcher.poll_refresh()
-        {
-            return Ok(Action::RefreshData);
+        // Check for filesystem changes. Remote-tracking ref updates (e.g. a
+        // push from another terminal) trigger a sync check for that repo;
+        // worktree changes trigger a reload unless one is already running
+        if let Some(watcher) = file_watcher.as_mut() {
+            let signals = watcher.poll();
+            for repo in signals.refs_changed {
+                background.sync.request_sync(repo, true);
+            }
+            if signals.refresh && background.loader.is_none() {
+                return Ok(Action::RefreshData);
+            }
         }
 
         // Use poll with timeout to allow checking for filesystem updates periodically
@@ -812,13 +1057,16 @@ fn tree_list_item<'a>(
                     Style::default().fg(Color::DarkGray),
                 ));
             }
-        } else if repo.operation_status == RepoOperationStatus::Cloning {
-            // Placeholder rows for in-flight clones have no real status yet
-            spans.push(Span::styled("· ", Style::default().fg(Color::DarkGray)));
-        } else if repo.is_clean {
-            spans.push(Span::styled("✓ ", Style::default().fg(Color::Green)));
         } else {
-            spans.push(Span::styled("* ", Style::default().fg(Color::Yellow)));
+            let (icon, color) = match repo.status {
+                // Not scanned yet (includes placeholder rows for clones)
+                None => ("· ", Color::DarkGray),
+                Some(crate::RepoStatus::Clean) => ("✓ ", Color::Green),
+                Some(crate::RepoStatus::Dirty) => ("* ", Color::Yellow),
+                Some(crate::RepoStatus::Unpushed) => ("↑ ", Color::Yellow),
+                Some(crate::RepoStatus::NoCommits) => ("· ", Color::DarkGray),
+            };
+            spans.push(Span::styled(icon, Style::default().fg(color)));
         }
     }
 
@@ -851,6 +1099,9 @@ fn tree_list_item<'a>(
 
         let (status_text, status_color) = match &repo.operation_status {
             RepoOperationStatus::None => (idle_metadata(repo), Color::DarkGray),
+            RepoOperationStatus::Scanning => ("scanning".to_string(), Color::DarkGray),
+            RepoOperationStatus::Syncing => ("syncing".to_string(), Color::Cyan),
+            RepoOperationStatus::SyncFailed(err) => (format!("sync failed: {}", err), Color::Red),
             RepoOperationStatus::Cloning => ("cloning...".to_string(), Color::Magenta),
             RepoOperationStatus::Dropping => ("dropping...".to_string(), Color::Yellow),
             RepoOperationStatus::Restoring => ("restoring...".to_string(), Color::Cyan),
@@ -1041,26 +1292,27 @@ fn render_highlighted_name<'a>(
 }
 
 /// Scan a single workspace repository, returning it and any submodules
-fn scan_workspace_repo(workspace_path: &str, path: PathBuf) -> Vec<RepoInfo> {
-    let display_name = path
-        .strip_prefix(workspace_path)
-        .unwrap_or(&path)
+/// Workspace-relative display name for a repo path
+fn workspace_display_name(workspace_path: &str, path: &Path) -> String {
+    path.strip_prefix(workspace_path)
+        .unwrap_or(path)
         .display()
         .to_string()
         .trim_start_matches('/')
-        .to_string();
+        .to_string()
+}
+
+fn scan_workspace_repo(workspace_path: &str, path: PathBuf) -> Vec<RepoInfo> {
+    let display_name = workspace_display_name(workspace_path, &path);
 
     // Check repo status and get modification time in a single repo open for performance
     let (status, modification_time) = crate::check_repo_status_and_modification_time(&path)
         .unwrap_or((crate::RepoStatus::NoCommits, None));
 
-    // A repo is only clean if it has commits, no changes, and no unpushed commits
-    let is_clean = matches!(status, crate::RepoStatus::Clean);
-
     let mut infos = vec![RepoInfo {
         path: path.clone(),
         display_name: display_name.clone(),
-        is_clean,
+        status: Some(status),
         modification_time,
         size_bytes: None, // Size not computed for workspace repos to save time
         operation_status: RepoOperationStatus::None,
@@ -1081,7 +1333,7 @@ fn scan_workspace_repo(workspace_path: &str, path: PathBuf) -> Vec<RepoInfo> {
             infos.push(RepoInfo {
                 path: path.join(&submodule.path),
                 display_name: submodule_display_name,
-                is_clean: true, // Submodule status computed separately
+                status: Some(crate::RepoStatus::Clean), // Submodule status computed separately
                 modification_time: None,
                 size_bytes: None,
                 operation_status: RepoOperationStatus::None,
@@ -1103,7 +1355,7 @@ fn scan_library_repo(library_path: &str, repo_path: String) -> RepoInfo {
         size_bytes: get_repo_size(&full_path).ok(),
         path: full_path,
         display_name: repo_path,
-        is_clean: true, // Library repos are always clean
+        status: Some(crate::RepoStatus::Clean), // Library repos are always clean
         operation_status: RepoOperationStatus::None,
         is_submodule: false,
         submodule_initialized: false,
@@ -1124,10 +1376,41 @@ fn scan_all_repos(workspace: &Workspace, tx: mpsc::Sender<LoadEvent>) {
     let library_paths = workspace.list_library().unwrap_or_default();
     let library_path = workspace.library_path();
 
+    // Announce the full repo set before any git work so every row can render
+    // with a "scanning" status right away
+    let discovered_workspace = workspace_paths
+        .iter()
+        .map(|path| RepoInfo {
+            path: path.clone(),
+            display_name: workspace_display_name(&workspace.path, path),
+            status: None,
+            modification_time: None,
+            size_bytes: None,
+            operation_status: RepoOperationStatus::Scanning,
+            is_submodule: false,
+            submodule_initialized: false,
+            parent_repo_path: None,
+        })
+        .collect();
+    let discovered_library = library_paths
+        .iter()
+        .map(|repo_path| RepoInfo {
+            path: PathBuf::from(&library_path).join(repo_path),
+            display_name: repo_path.clone(),
+            status: Some(crate::RepoStatus::Clean),
+            modification_time: None,
+            size_bytes: None,
+            operation_status: RepoOperationStatus::Scanning,
+            is_submodule: false,
+            submodule_initialized: false,
+            parent_repo_path: None,
+        })
+        .collect();
     if tx
-        .send(LoadEvent::Total(
-            workspace_paths.len() + library_paths.len(),
-        ))
+        .send(LoadEvent::Discovered {
+            workspace: discovered_workspace,
+            library: discovered_library,
+        })
         .is_err()
     {
         return;
@@ -1250,4 +1533,42 @@ fn get_gitlab_suggestions() -> Vec<String> {
             .collect();
     }
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_manager_dedups_and_requeues() {
+        let mut mgr = SyncManager::new("ws".to_string());
+        let repo = PathBuf::from("ws/repo");
+
+        mgr.request_sync(repo.clone(), false);
+        mgr.request_sync(repo.clone(), false);
+        assert_eq!(mgr.queue.len(), 1);
+
+        // Simulate the job being picked up
+        mgr.queue.pop_front();
+        mgr.in_flight.insert(repo.clone());
+
+        // Requests during a running sync are deferred, not duplicated
+        mgr.request_sync(repo.clone(), false);
+        assert!(mgr.queue.is_empty());
+        assert!(mgr.rerun_after.contains(&repo));
+
+        // Finishing re-queues the deferred request and stamps the cooldown
+        mgr.finish(&repo);
+        assert!(!mgr.in_flight.contains(&repo));
+        assert_eq!(mgr.queue.len(), 1);
+
+        // Watcher-triggered requests inside the cooldown are dropped
+        mgr.queue.clear();
+        mgr.request_sync(repo.clone(), true);
+        assert!(mgr.queue.is_empty());
+
+        // Explicit (non-watcher) requests ignore the cooldown
+        mgr.request_sync(repo.clone(), false);
+        assert_eq!(mgr.queue.len(), 1);
+    }
 }
